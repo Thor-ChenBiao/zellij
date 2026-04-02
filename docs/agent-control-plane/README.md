@@ -101,6 +101,160 @@ Suggested endpoint shape:
 }
 ```
 
+### Shared ID Model
+
+The user-facing model must stay very simple.
+
+The system should not require the user to know or type runtime-generated internal IDs.
+
+The recommended user-facing concept is a single shared ID.
+
+Suggested terms:
+
+- `shared_id`
+- or simply `id`
+
+Meaning:
+
+- if no ID is provided, a new collaboration group is created and a new ID is generated
+- if an ID is provided and already exists, the participant joins it
+- if an ID is provided and does not exist yet, the participant creates it
+
+This solves the bootstrapping problem without requiring a separate create step.
+
+### Internal vs user-facing IDs
+
+Internally, the system should still keep richer identities:
+
+- `shared_id`
+  the only ID the user normally needs
+- `endpoint_id`
+  the runtime identity of one connected participant
+- `agent_id`
+  optional logical identity for a reusable agent persona
+
+But only `shared_id` should be treated as the default user-facing handle.
+
+Example:
+
+```json
+{
+  "shared_id": "482731",
+  "endpoint_id": "endpoint-9b1f",
+  "agent_id": "claude-driver-main",
+  "role": "driver"
+}
+```
+
+### Why shared_id first
+
+This solves the "who starts first?" problem with one rule:
+
+- no ID means create a fresh group and print its ID
+- an explicit ID means create-or-join that group
+
+This is deliberately close to lightweight meeting-room flows.
+
+The user experience should feel like:
+
+- start something
+- get an ID
+- tell the next participant the ID
+- they start with that ID and join immediately
+
+### Roles inside a shared group
+
+A shared ID can contain multiple participants with different roles:
+
+- `driver`
+- `reviewer`
+- `human`
+- `viewer`
+- `manager`
+
+Roles can change over time.
+One participant may even hold multiple roles if needed.
+
+### Recommended group metadata
+
+Suggested fields:
+
+- `shared_id`
+- `name`
+- `created_by`
+- `created_at`
+- `shared_task_id`
+- `repo_root`
+- `current_driver_endpoint_id`
+- `visibility`
+- `transport`
+
+### Presence and discovery
+
+Once connected through a shared ID, each participant should be discoverable.
+
+Suggested presence payload:
+
+```json
+{
+  "shared_id": "482731",
+  "endpoint_id": "endpoint-9b1f",
+  "agent_id": "claude-driver-main",
+  "provider": "claude",
+  "role": "driver",
+  "status": "online",
+  "pane_id": "terminal_7"
+}
+```
+
+The bridge should answer these questions in realtime:
+
+- what shared IDs exist?
+- who is inside each shared group?
+- what roles are present?
+- which endpoint is the active driver?
+- which endpoints are writable?
+
+### Create-or-join semantics
+
+Every major entry command should use the same rule:
+
+- no positional ID argument: create a new shared group and print the generated ID
+- positional ID present: join if found, create if missing
+
+This keeps the model extremely small and consistent.
+
+### Endpoint targeting
+
+Most human-facing commands should accept either:
+
+- a `shared_id`
+- an `endpoint_id`
+
+Rule of thumb:
+
+- shared-id-targeted commands are for joining, discovery, or broadcast
+- endpoint-targeted commands are for direct injection or precise control
+
+Examples:
+
+- send a human message to the active driver in shared group `482731`
+- send a review comment directly to `endpoint-9b1f`
+
+### Message routing rule
+
+The bridge should allow routing by:
+
+- explicit endpoint
+- current room role
+
+Examples:
+
+- `target_endpoint_id = endpoint-9b1f`
+- `target_role = driver in shared_id 482731`
+
+This allows human and reviewer commands to stay simple.
+
 ### Channel Model
 
 The bridge should define a small number of typed channels.
@@ -261,6 +415,108 @@ Even before deeper source changes, Zellij already provides useful control primit
 - subscribe to pane render updates
 
 These primitives are enough to validate the bridge concept before deeper integration into the PTY path.
+
+### Suggested Command Surface
+
+The command model should stay extremely simple and natural.
+
+The user should not need to run a separate explicit "create room" command in the common path.
+
+The core rule:
+
+- start without an ID -> create a new shared group and print the generated ID
+- start with an ID -> join if found, create if missing
+
+This should apply consistently to driver and reviewer entrypoints.
+
+#### Proposed commands
+
+Driver entrypoints:
+
+- `zellij claude [id]`
+- `zellij codex [id]`
+- `zellij gemini [id]`
+
+Examples:
+
+- `zellij claude`
+  creates a new shared group and prints a new ID
+- `zellij claude 482731`
+  joins or creates shared group `482731`
+- `zellij codex 482731`
+  joins or creates shared group `482731`
+
+Reviewer entrypoint:
+
+- `zellij reviewer [id]`
+
+Examples:
+
+- `zellij reviewer`
+  creates a new shared group and starts a reviewer there
+- `zellij reviewer 482731`
+  joins shared group `482731` and starts reviewing there
+
+Observation entrypoints:
+
+- `zellij view events [id]`
+- `zellij view code [id]`
+- later `zellij view board [id]`
+
+Examples:
+
+- `zellij view events 482731`
+- `zellij view code 482731`
+
+#### Optional explicit bridge commands
+
+These are still useful for debugging and advanced control, but they should not be the main UX:
+
+- `zellij bridge list`
+- `zellij bridge who 482731`
+- `zellij bridge send 482731 --role driver --text "补一个回归测试"`
+- `zellij bridge send --endpoint endpoint-9b1f --text "先跑测试再继续"`
+
+### Reviewer command shape
+
+The reviewer should be a first-class command, not just an internal process.
+
+Suggested entrypoint:
+
+- `zellij reviewer [id]`
+
+Suggested options:
+
+- `--watch-role driver`
+- `--mode observe|suggest|auto-review|gatekeeper`
+- `--provider claude|codex|gemini`
+- `--send-direct`
+- `--needs-human-approval`
+
+Examples:
+
+- `zellij reviewer 482731 --watch-role driver --mode suggest`
+- `zellij reviewer 482731 --watch-role driver --mode auto-review`
+
+The reviewer itself should also register as an endpoint in the room.
+
+That means:
+
+- it gets its own `endpoint_id`
+- it can receive control messages
+- another reviewer or human can also message it
+
+This makes reviewer composable instead of special-cased.
+
+### View command shape
+
+Suggested view commands:
+
+- `zellij view events [id]`
+- `zellij view code [id]`
+- later `zellij view board [id]`
+
+These views should resolve the shared ID first and then subscribe to the relevant endpoints.
 
 ## Part 2: Reviewer
 
