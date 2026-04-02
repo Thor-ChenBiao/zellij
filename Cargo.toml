@@ -26,9 +26,12 @@ interprocess = { workspace = true }
 log = { workspace = true }
 miette = { workspace = true }
 names = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 suggest = { workspace = true }
 thiserror = { workspace = true }
 isahc = { workspace = true }
+uuid = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true }
@@ -41,6 +44,7 @@ insta = { version = "1.6.0", features = ["backtrace"] }
 ssh2 = "0.9.1"
 rand = "0.8.0"
 regex = "1.8.1"
+tempfile = { workspace = true }
 vte = { workspace = true }
 
 [workspace]

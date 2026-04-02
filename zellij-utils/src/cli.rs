@@ -109,6 +109,27 @@ pub enum Command {
     #[clap(name = "options", value_parser)]
     Options(Options),
 
+    /// Create or join a shared room for a Claude coding agent
+    #[clap(name = "claude", visible_alias = "cc")]
+    Claude(RoomCli),
+
+    /// Create or join a shared room for a Codex coding agent
+    #[clap(name = "codex")]
+    Codex(RoomCli),
+
+    /// Create or join a shared room for a Gemini coding agent
+    #[clap(name = "gemini")]
+    Gemini(RoomCli),
+
+    /// Create or join a shared room for a reviewer agent
+    #[clap(name = "reviewer", visible_alias = "rv")]
+    Reviewer(RoomCli),
+
+    /// View shared room activity streams
+    #[clap(name = "view")]
+    #[clap(subcommand)]
+    View(ViewCli),
+
     /// Setup zellij and check its configuration
     #[clap(name = "setup", value_parser)]
     Setup(Setup),
@@ -131,6 +152,21 @@ pub enum Command {
         "zellij [--session <OTHER SESSION NAME>] subscribe [OPTIONS] --pane-id..."
     ))]
     Subscribe(SubscribeCli),
+}
+
+#[derive(Debug, Clone, Args, Serialize, Deserialize)]
+pub struct RoomCli {
+    /// Shared room ID. If omitted, Zellij creates one and prints it.
+    #[clap(value_parser = validate_session)]
+    pub shared_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Subcommand, Serialize, Deserialize)]
+pub enum ViewCli {
+    /// Follow the room's event stream
+    Events(RoomCli),
+    /// Follow the room's code stream
+    Code(RoomCli),
 }
 
 #[derive(Debug, Parser, Clone, Serialize, Deserialize)]

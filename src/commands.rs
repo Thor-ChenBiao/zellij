@@ -1,3 +1,7 @@
+use crate::agent_control_plane::{
+    append_stream_event, follow_stream, list_room_endpoints, register_participant, room_metadata,
+    AgentPersona, ViewStreamKind,
+};
 use dialoguer::Confirm;
 use std::net::IpAddr;
 use std::{fs::File, io::prelude::*, path::PathBuf, process, time::Duration};
@@ -35,6 +39,7 @@ use zellij_utils::web_authentication_tokens::{
 };
 
 use miette::{Report, Result};
+use serde_json::json;
 use zellij_server::{os_input_output::get_server_os_input, start_server as start_server_impl};
 use zellij_utils::{
     cli::{CliArgs, Command, SessionCommand, Sessions},
@@ -222,6 +227,148 @@ pub(crate) fn start_web_server(
 
 fn create_new_client() -> ClientInfo {
     ClientInfo::New(generate_unique_session_name_or_exit(), None, None)
+}
+
+fn attach_create_command(session_name: String) -> Command {
+    Command::Sessions(Sessions::Attach {
+        session_name: Some(session_name),
+        create: true,
+        create_background: false,
+        index: None,
+        options: None,
+        force_run_commands: false,
+        token: None,
+        remember: false,
+        forget: false,
+        ca_cert: None,
+        insecure: false,
+    })
+}
+
+pub(crate) fn start_shared_room(
+    mut opts: CliArgs,
+    persona: AgentPersona,
+    shared_id: Option<String>,
+) {
+    let shared_id = shared_id.unwrap_or_else(generate_unique_session_name_or_exit);
+    let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let participant = match register_participant(&shared_id, persona, &current_dir) {
+        Ok(participant) => participant,
+        Err(e) => {
+            eprintln!("Failed to register shared room '{}': {}", shared_id, e);
+            process::exit(2);
+        },
+    };
+    let _ = append_stream_event(
+        ViewStreamKind::Code,
+        &shared_id,
+        "room_ready",
+        Some(&participant.endpoint),
+        format!(
+            "{} reserved the code stream for session '{}'",
+            participant.endpoint.provider, participant.session_name
+        ),
+        json!({
+            "cwd": participant.endpoint.cwd,
+            "note": "Live file and command mirroring will append here in later bridge stages.",
+        }),
+    );
+
+    std::env::set_var("ZELLIJ_AGENT_SHARED_ID", &shared_id);
+    std::env::set_var(
+        "ZELLIJ_AGENT_ENDPOINT_ID",
+        &participant.endpoint.endpoint_id,
+    );
+    std::env::set_var("ZELLIJ_AGENT_PROVIDER", &participant.endpoint.provider);
+    std::env::set_var("ZELLIJ_AGENT_ROLE", &participant.endpoint.role);
+
+    println!(
+        "Shared room: {} ({})",
+        shared_id,
+        if participant.room_created {
+            "created"
+        } else {
+            "joined"
+        }
+    );
+    println!("Session name: {}", participant.session_name);
+    println!(
+        "Endpoint: {} [{} / {}]",
+        participant.endpoint.label, participant.endpoint.provider, participant.endpoint.role
+    );
+    if persona == AgentPersona::Reviewer {
+        println!("");
+        println!("Reviewer bootstrap:");
+        println!(
+            "{}",
+            participant
+                .endpoint
+                .reviewer_bootstrap_prompt
+                .as_deref()
+                .unwrap_or_default()
+        );
+        println!("");
+        println!("Review message template:");
+        println!(
+            "{}",
+            participant
+                .endpoint
+                .review_message_template
+                .as_deref()
+                .unwrap_or_default()
+        );
+    } else {
+        println!(
+            "Share this room with another participant using: zellij reviewer {}",
+            shared_id
+        );
+    }
+
+    opts.session = None;
+    opts.command = Some(attach_create_command(shared_id));
+    start_client(opts);
+}
+
+pub(crate) fn view_shared_room(stream: ViewStreamKind, shared_id: Option<String>) {
+    let shared_id = shared_id.unwrap_or_else(generate_unique_session_name_or_exit);
+    let _ = crate::agent_control_plane::ensure_room(&shared_id).unwrap_or_else(|e| {
+        eprintln!("Failed to initialize shared room '{}': {}", shared_id, e);
+        process::exit(2);
+    });
+    let metadata = room_metadata(&shared_id).unwrap_or_else(|e| {
+        eprintln!("Failed to read room metadata for '{}': {}", shared_id, e);
+        process::exit(2);
+    });
+    let endpoints = list_room_endpoints(&shared_id).unwrap_or_else(|e| {
+        eprintln!("Failed to read endpoints for '{}': {}", shared_id, e);
+        process::exit(2);
+    });
+    println!(
+        "Shared room: {} | session: {} | stream: {}",
+        metadata.shared_id,
+        metadata.session_name,
+        match stream {
+            ViewStreamKind::Events => "events",
+            ViewStreamKind::Code => "code",
+        }
+    );
+    println!(
+        "Transport: {} | network: {}",
+        metadata.bridge_transport, metadata.network_transport
+    );
+    println!("Participants:");
+    for endpoint in endpoints {
+        println!(
+            "- {} [{} / {}] {}",
+            endpoint.label, endpoint.provider, endpoint.role, endpoint.cwd
+        );
+    }
+    println!("");
+    println!("Following stream. Press Ctrl-C to stop.");
+    if let Err(e) = follow_stream(&shared_id, stream) {
+        eprintln!("Failed to follow stream for '{}': {}", shared_id, e);
+        process::exit(2);
+    }
 }
 
 #[cfg(feature = "web_server_capability")]

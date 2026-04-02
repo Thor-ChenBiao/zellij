@@ -5,6 +5,29 @@ This document records a design direction for building an agent-oriented workflow
 The goal is not to integrate many provider-native desktop apps.
 The goal is to standardize on Zellij as the runtime shell and add the missing collaboration primitives directly into Zellij.
 
+## Current MVP Status
+
+The repository now includes a first-stage command surface and local room metadata layer:
+
+- `zellij claude [id]`
+- `zellij codex [id]`
+- `zellij gemini [id]`
+- `zellij reviewer [id]`
+- `zellij view events [id]`
+- `zellij view code [id]`
+
+Current behavior:
+
+- no `id` creates a new shared room ID and prints it
+- passing an `id` joins that room if it already exists or creates it otherwise
+- room and participant metadata are persisted under the Zellij cache directory
+- `reviewer` records a bootstrap prompt and a fixed review message template
+- `view events` and `view code` follow room-owned stream files
+
+This is intentionally a foundation release.
+The bridge does not yet mirror live pane input/output or pane-local file edits.
+That next stage will connect these room streams to real pane IO.
+
 Initial target providers:
 
 - Claude Code

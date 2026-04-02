@@ -1,7 +1,9 @@
+mod agent_control_plane;
 mod commands;
 #[cfg(test)]
 mod tests;
 
+use crate::agent_control_plane::{AgentPersona, ViewStreamKind};
 use clap::Parser;
 use zellij_utils::{
     cli::{CliAction, CliArgs, Command, Sessions},
@@ -18,6 +20,34 @@ fn main() {
     configure_logger();
     create_config_and_cache_folders();
     let opts = CliArgs::parse();
+
+    if let Some(Command::Claude(room_cli)) = opts.command.clone() {
+        commands::start_shared_room(opts, AgentPersona::Claude, room_cli.shared_id);
+        std::process::exit(0);
+    }
+    if let Some(Command::Codex(room_cli)) = opts.command.clone() {
+        commands::start_shared_room(opts, AgentPersona::Codex, room_cli.shared_id);
+        std::process::exit(0);
+    }
+    if let Some(Command::Gemini(room_cli)) = opts.command.clone() {
+        commands::start_shared_room(opts, AgentPersona::Gemini, room_cli.shared_id);
+        std::process::exit(0);
+    }
+    if let Some(Command::Reviewer(room_cli)) = opts.command.clone() {
+        commands::start_shared_room(opts, AgentPersona::Reviewer, room_cli.shared_id);
+        std::process::exit(0);
+    }
+    if let Some(Command::View(view_cli)) = opts.command.clone() {
+        match view_cli {
+            zellij_utils::cli::ViewCli::Events(room_cli) => {
+                commands::view_shared_room(ViewStreamKind::Events, room_cli.shared_id)
+            },
+            zellij_utils::cli::ViewCli::Code(room_cli) => {
+                commands::view_shared_room(ViewStreamKind::Code, room_cli.shared_id)
+            },
+        }
+        std::process::exit(0);
+    }
 
     {
         let config = Config::try_from(&opts).ok();
