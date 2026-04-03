@@ -28,6 +28,10 @@ This is intentionally a foundation release.
 The bridge does not yet mirror live pane input/output or pane-local file edits.
 That next stage will connect these room streams to real pane IO.
 
+Progress log:
+
+- [2026-04-03 progress](/Users/chenbiao/zellij/docs/agent-control-plane/progress/2026-04-03.md)
+
 Initial target providers:
 
 - Claude Code
