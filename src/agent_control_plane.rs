@@ -1,6 +1,7 @@
 use humantime::format_rfc3339_seconds;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -10,6 +11,7 @@ use uuid::Uuid;
 use zellij_utils::consts::{VERSION, ZELLIJ_CACHE_DIR};
 
 const ROOM_SCHEMA_VERSION: u32 = 1;
+const REVIEW_SCHEMA_VERSION: u32 = 1;
 const REVIEW_TARGET_ROLE: &str = "driver";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,6 +96,59 @@ pub(crate) struct RegisteredRoomParticipant {
     pub session_name: String,
     pub room_created: bool,
     pub endpoint: EndpointMetadata,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct ReviewRequest {
+    pub schema_version: u32,
+    pub room_id: String,
+    pub request_id: String,
+    pub driver_endpoint: Option<String>,
+    pub target_role: String,
+    pub mode: String,
+    pub reason: String,
+    pub changed_files: Vec<String>,
+    pub last_commands: Vec<String>,
+    pub recent_output: Vec<String>,
+    pub recent_code_snapshot: Vec<String>,
+    pub task: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct ReviewFeedback {
+    pub schema_version: u32,
+    pub room_id: String,
+    pub request_id: String,
+    pub source_endpoint: String,
+    pub target_role: String,
+    pub severity: String,
+    pub confidence: String,
+    pub should_send: bool,
+    pub summary: String,
+    pub findings: Vec<String>,
+    pub actions: Vec<String>,
+    pub notes: Vec<String>,
+    pub created_at: String,
+    pub raw_text: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PersistedReviewRequest {
+    pub request: ReviewRequest,
+    pub text: String,
+    pub json_path: PathBuf,
+    pub text_path: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PersistedReviewFeedback {
+    pub feedback: ReviewFeedback,
+    pub text: String,
+    pub json_path: PathBuf,
+    pub text_path: PathBuf,
+    pub driver_envelope: Option<String>,
+    pub driver_envelope_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -194,6 +249,50 @@ fn stream_paths(shared_id: &str, stream: ViewStreamKind) -> (PathBuf, PathBuf) {
     }
 }
 
+fn review_dir_in_root(root: &Path, shared_id: &str) -> PathBuf {
+    root.join(shared_id).join("review")
+}
+
+fn review_requests_dir_in_root(root: &Path, shared_id: &str) -> PathBuf {
+    review_dir_in_root(root, shared_id).join("requests")
+}
+
+fn review_feedback_dir_in_root(root: &Path, shared_id: &str) -> PathBuf {
+    review_dir_in_root(root, shared_id).join("feedback")
+}
+
+fn review_inbox_dir_in_root(root: &Path, shared_id: &str) -> PathBuf {
+    review_dir_in_root(root, shared_id).join("driver-inbox")
+}
+
+fn latest_review_request_json_path_in_root(root: &Path, shared_id: &str) -> PathBuf {
+    review_requests_dir_in_root(root, shared_id).join("latest.json")
+}
+
+fn latest_review_request_text_path_in_root(root: &Path, shared_id: &str) -> PathBuf {
+    review_requests_dir_in_root(root, shared_id).join("latest.txt")
+}
+
+fn review_request_history_jsonl_path_in_root(root: &Path, shared_id: &str) -> PathBuf {
+    review_requests_dir_in_root(root, shared_id).join("history.jsonl")
+}
+
+fn latest_review_feedback_json_path_in_root(root: &Path, shared_id: &str) -> PathBuf {
+    review_feedback_dir_in_root(root, shared_id).join("latest.json")
+}
+
+fn latest_review_feedback_text_path_in_root(root: &Path, shared_id: &str) -> PathBuf {
+    review_feedback_dir_in_root(root, shared_id).join("latest.txt")
+}
+
+fn review_feedback_history_jsonl_path_in_root(root: &Path, shared_id: &str) -> PathBuf {
+    review_feedback_dir_in_root(root, shared_id).join("history.jsonl")
+}
+
+fn latest_driver_envelope_path_in_root(root: &Path, shared_id: &str) -> PathBuf {
+    review_inbox_dir_in_root(root, shared_id).join("latest.txt")
+}
+
 fn ensure_room_files(root: &Path, shared_id: &str, session_name: &str) -> io::Result<bool> {
     fs::create_dir_all(root.join(shared_id).join("endpoints"))?;
     let metadata_path = root.join(shared_id).join("room.json");
@@ -290,6 +389,537 @@ fn register_participant_at(
         session_name,
         room_created,
         endpoint,
+    })
+}
+
+fn room_metadata_at(root: &Path, shared_id: &str) -> io::Result<RoomMetadata> {
+    let raw = fs::read_to_string(root.join(shared_id).join("room.json"))?;
+    serde_json::from_str(&raw).map_err(json_to_io_error)
+}
+
+fn list_room_endpoints_at(root: &Path, shared_id: &str) -> io::Result<Vec<EndpointMetadata>> {
+    let endpoints_dir = root.join(shared_id).join("endpoints");
+    if !endpoints_dir.exists() {
+        return Ok(vec![]);
+    }
+    let mut endpoints = vec![];
+    for entry in fs::read_dir(endpoints_dir)? {
+        let entry = entry?;
+        if entry.file_type()?.is_file() {
+            let raw = fs::read_to_string(entry.path())?;
+            let endpoint: EndpointMetadata =
+                serde_json::from_str(&raw).map_err(json_to_io_error)?;
+            endpoints.push(endpoint);
+        }
+    }
+    endpoints.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+    Ok(endpoints)
+}
+
+fn append_jsonl<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
+    append_line(
+        path,
+        &serde_json::to_string(value).map_err(json_to_io_error)?,
+    )
+}
+
+fn read_stream_events_at(
+    root: &Path,
+    shared_id: &str,
+    stream: ViewStreamKind,
+) -> io::Result<Vec<StreamEvent>> {
+    let (_, jsonl_path) = match stream {
+        ViewStreamKind::Events => (
+            root.join(shared_id).join("events.log"),
+            root.join(shared_id).join("events.jsonl"),
+        ),
+        ViewStreamKind::Code => (
+            root.join(shared_id).join("code.log"),
+            root.join(shared_id).join("code.jsonl"),
+        ),
+    };
+    if !jsonl_path.exists() {
+        return Ok(vec![]);
+    }
+    let raw = fs::read_to_string(jsonl_path)?;
+    raw.lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str::<StreamEvent>(line).map_err(json_to_io_error))
+        .collect()
+}
+
+fn next_review_request_id(root: &Path, shared_id: &str) -> String {
+    let count = fs::read_to_string(review_request_history_jsonl_path_in_root(root, shared_id))
+        .ok()
+        .map(|raw| raw.lines().filter(|line| !line.trim().is_empty()).count())
+        .unwrap_or(0);
+    format!("rr-{:04}", count + 1)
+}
+
+fn push_unique(vec: &mut Vec<String>, seen: &mut HashSet<String>, value: String) {
+    if seen.insert(value.clone()) {
+        vec.push(value);
+    }
+}
+
+fn synthesize_recent_code_snapshot(code_events: &[StreamEvent]) -> Vec<String> {
+    code_events
+        .iter()
+        .rev()
+        .find_map(|event| {
+            event
+                .payload
+                .get("viewport")
+                .and_then(|viewport| viewport.as_array())
+                .map(|viewport| {
+                    viewport
+                        .iter()
+                        .filter_map(|line| line.as_str().map(|line| line.to_owned()))
+                        .take(12)
+                        .collect::<Vec<_>>()
+                })
+        })
+        .unwrap_or_default()
+}
+
+fn render_list_section(title: &str, values: &[String]) -> String {
+    let mut section = format!("{title}:\n");
+    if values.is_empty() {
+        section.push_str("- <none>\n");
+    } else {
+        for value in values {
+            section.push_str(&format!("- {value}\n"));
+        }
+    }
+    section
+}
+
+fn render_review_request_text(request: &ReviewRequest) -> String {
+    let mut text = String::new();
+    text.push_str("[ACP_REVIEW_REQUEST_BEGIN]\n");
+    text.push_str(&format!("room_id: {}\n", request.room_id));
+    text.push_str(&format!("request_id: {}\n", request.request_id));
+    text.push_str(&format!(
+        "driver_endpoint: {}\n",
+        request
+            .driver_endpoint
+            .as_deref()
+            .unwrap_or("<unknown-driver>")
+    ));
+    text.push_str(&format!("target_role: {}\n", request.target_role));
+    text.push_str(&format!("mode: {}\n", request.mode));
+    text.push_str(&format!("reason: {}\n\n", request.reason));
+    text.push_str(&render_list_section(
+        "changed_files",
+        &request.changed_files,
+    ));
+    text.push('\n');
+    text.push_str(&render_list_section(
+        "last_commands",
+        &request.last_commands,
+    ));
+    text.push('\n');
+    text.push_str(&render_list_section(
+        "recent_output",
+        &request.recent_output,
+    ));
+    text.push('\n');
+    text.push_str(&render_list_section(
+        "recent_code_snapshot",
+        &request.recent_code_snapshot,
+    ));
+    text.push('\n');
+    text.push_str("task:\n");
+    text.push_str(&request.task);
+    text.push('\n');
+    text.push_str("[ACP_REVIEW_REQUEST_END]\n");
+    text
+}
+
+fn prepare_review_request_at(
+    root: &Path,
+    shared_id: &str,
+    reason: Option<&str>,
+) -> io::Result<PersistedReviewRequest> {
+    let _ = room_metadata_at(root, shared_id)?;
+    let endpoints = list_room_endpoints_at(root, shared_id)?;
+    let driver_endpoint = endpoints
+        .iter()
+        .rev()
+        .find(|endpoint| endpoint.role == REVIEW_TARGET_ROLE)
+        .map(|endpoint| endpoint.endpoint_id.clone());
+    let events = read_stream_events_at(root, shared_id, ViewStreamKind::Events)?;
+    let code_events = read_stream_events_at(root, shared_id, ViewStreamKind::Code)?;
+
+    let mut changed_files = vec![];
+    let mut changed_files_seen = HashSet::new();
+    for event in &code_events {
+        if let Some(file_path) = event.payload.get("file_path").and_then(|v| v.as_str()) {
+            push_unique(
+                &mut changed_files,
+                &mut changed_files_seen,
+                file_path.to_owned(),
+            );
+        }
+    }
+
+    let mut last_commands = vec![];
+    let mut last_commands_seen = HashSet::new();
+    for event in events.iter().rev() {
+        if event.kind == "tool_call"
+            && event
+                .payload
+                .get("tool")
+                .and_then(|tool| tool.as_str())
+                .map(|tool| tool == "Bash")
+                .unwrap_or(false)
+        {
+            if let Some(command) = event.payload.get("value").and_then(|value| value.as_str()) {
+                push_unique(
+                    &mut last_commands,
+                    &mut last_commands_seen,
+                    command.to_owned(),
+                );
+            }
+        }
+        if last_commands.len() >= 5 {
+            break;
+        }
+    }
+    last_commands.reverse();
+
+    let mut recent_output: Vec<String> = events
+        .iter()
+        .rev()
+        .filter(|event| {
+            matches!(
+                event.kind.as_str(),
+                "tool_call"
+                    | "write_character"
+                    | "write_to_pane_id"
+                    | "write_key_to_pane_id"
+                    | "paste"
+                    | "review_feedback_recorded"
+            )
+        })
+        .map(|event| event.message.clone())
+        .take(6)
+        .collect();
+    recent_output.reverse();
+
+    let request = ReviewRequest {
+        schema_version: REVIEW_SCHEMA_VERSION,
+        room_id: shared_id.to_owned(),
+        request_id: next_review_request_id(root, shared_id),
+        driver_endpoint,
+        target_role: REVIEW_TARGET_ROLE.to_owned(),
+        mode: "approval".to_owned(),
+        reason: reason
+            .unwrap_or("manual_request_from_room_stream")
+            .to_owned(),
+        changed_files,
+        last_commands,
+        recent_output,
+        recent_code_snapshot: synthesize_recent_code_snapshot(&code_events),
+        task: "Review 最新的 driver 活动。只返回一个 ACP_REVIEW_RESPONSE_V1 block。".to_owned(),
+        created_at: now_string(),
+    };
+    let text = render_review_request_text(&request);
+    let json_path = latest_review_request_json_path_in_root(root, shared_id);
+    let text_path = latest_review_request_text_path_in_root(root, shared_id);
+    write_json(&json_path, &request)?;
+    fs::write(&text_path, &text)?;
+    append_jsonl(
+        &review_request_history_jsonl_path_in_root(root, shared_id),
+        &request,
+    )?;
+    append_stream_event_at(
+        root,
+        ViewStreamKind::Events,
+        shared_id,
+        "review_request_generated",
+        None,
+        format!("Prepared review request {}", request.request_id),
+        json!({
+            "request_id": request.request_id,
+            "driver_endpoint": request.driver_endpoint,
+            "changed_files": request.changed_files,
+            "last_commands": request.last_commands,
+        }),
+    )?;
+    Ok(PersistedReviewRequest {
+        request,
+        text,
+        json_path,
+        text_path,
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FeedbackSection {
+    Fields,
+    Findings,
+    Actions,
+    Notes,
+}
+
+fn extract_review_feedback_block(raw: &str) -> io::Result<String> {
+    let start_marker = "[ACP_REVIEW_RESPONSE_V1]";
+    let end_marker = "[/ACP_REVIEW_RESPONSE_V1]";
+    let start = raw.find(start_marker).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Missing ACP review response start marker",
+        )
+    })?;
+    let end = raw.find(end_marker).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Missing ACP review response end marker",
+        )
+    })?;
+    Ok(raw[start + start_marker.len()..end].trim().to_owned())
+}
+
+fn parse_key_value(line: &str) -> Option<(&str, &str)> {
+    let (key, value) = line.split_once(':')?;
+    Some((key.trim(), value.trim()))
+}
+
+fn parse_bool(value: &str) -> bool {
+    matches!(value, "true" | "True" | "TRUE" | "yes" | "1")
+}
+
+fn parse_review_feedback(
+    shared_id: &str,
+    raw_text: &str,
+    source_endpoint_override: Option<&str>,
+) -> io::Result<ReviewFeedback> {
+    let block = extract_review_feedback_block(raw_text)?;
+    let mut room_id = None;
+    let mut request_id = None;
+    let mut source_endpoint = source_endpoint_override.map(|v| v.to_owned());
+    let mut target_role = Some(REVIEW_TARGET_ROLE.to_owned());
+    let mut severity = Some("medium".to_owned());
+    let mut confidence = Some("medium".to_owned());
+    let mut should_send = true;
+    let mut summary = None;
+    let mut findings = vec![];
+    let mut actions = vec![];
+    let mut notes = vec![];
+    let mut section = FeedbackSection::Fields;
+
+    for raw_line in block.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        match line {
+            "findings:" => {
+                section = FeedbackSection::Findings;
+                continue;
+            },
+            "actions:" => {
+                section = FeedbackSection::Actions;
+                continue;
+            },
+            "notes:" => {
+                section = FeedbackSection::Notes;
+                continue;
+            },
+            _ => {},
+        }
+        if let Some(value) = line.strip_prefix("- ") {
+            match section {
+                FeedbackSection::Findings => findings.push(value.to_owned()),
+                FeedbackSection::Actions => actions.push(value.to_owned()),
+                FeedbackSection::Notes => notes.push(value.to_owned()),
+                FeedbackSection::Fields => {},
+            }
+            continue;
+        }
+        if let Some((key, value)) = parse_key_value(line) {
+            match key {
+                "room_id" => room_id = Some(value.to_owned()),
+                "request_id" => request_id = Some(value.to_owned()),
+                "source_endpoint" => source_endpoint = Some(value.to_owned()),
+                "target_role" => target_role = Some(value.to_owned()),
+                "severity" => severity = Some(value.to_owned()),
+                "confidence" => confidence = Some(value.to_owned()),
+                "should_send" => should_send = parse_bool(value),
+                "summary" => summary = Some(value.to_owned()),
+                _ => {},
+            }
+        }
+    }
+
+    let room_id = room_id.unwrap_or_else(|| shared_id.to_owned());
+    if room_id != shared_id {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "Feedback room_id '{}' does not match target room '{}'",
+                room_id, shared_id
+            ),
+        ));
+    }
+    let request_id = request_id.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Feedback is missing request_id",
+        )
+    })?;
+    let source_endpoint = source_endpoint.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Feedback is missing source_endpoint",
+        )
+    })?;
+    let summary = summary.ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "Feedback is missing summary")
+    })?;
+
+    Ok(ReviewFeedback {
+        schema_version: REVIEW_SCHEMA_VERSION,
+        room_id,
+        request_id,
+        source_endpoint,
+        target_role: target_role.unwrap_or_else(|| REVIEW_TARGET_ROLE.to_owned()),
+        severity: severity.unwrap_or_else(|| "medium".to_owned()),
+        confidence: confidence.unwrap_or_else(|| "medium".to_owned()),
+        should_send,
+        summary,
+        findings,
+        actions,
+        notes,
+        created_at: now_string(),
+        raw_text: raw_text.to_owned(),
+    })
+}
+
+fn render_review_feedback_text(feedback: &ReviewFeedback) -> String {
+    let mut text = String::new();
+    text.push_str("[ACP_REVIEW_RESPONSE_V1]\n");
+    text.push_str(&format!("room_id: {}\n", feedback.room_id));
+    text.push_str(&format!("request_id: {}\n", feedback.request_id));
+    text.push_str(&format!("source_endpoint: {}\n", feedback.source_endpoint));
+    text.push_str(&format!("target_role: {}\n", feedback.target_role));
+    text.push_str(&format!("severity: {}\n", feedback.severity));
+    text.push_str(&format!("confidence: {}\n", feedback.confidence));
+    text.push_str(&format!("should_send: {}\n", feedback.should_send));
+    text.push_str(&format!("summary: {}\n\n", feedback.summary));
+    text.push_str(&render_list_section("findings", &feedback.findings));
+    text.push('\n');
+    text.push_str(&render_list_section("actions", &feedback.actions));
+    text.push('\n');
+    text.push_str(&render_list_section("notes", &feedback.notes));
+    text.push_str("[/ACP_REVIEW_RESPONSE_V1]\n");
+    text
+}
+
+fn render_driver_feedback_envelope(feedback: &ReviewFeedback) -> String {
+    let mut text = String::new();
+    text.push_str("[ACP_MESSAGE_BEGIN]\n");
+    text.push_str(&format!("room_id: {}\n", feedback.room_id));
+    text.push_str("message_type: review_feedback\n");
+    text.push_str("source_role: reviewer\n");
+    text.push_str(&format!("source_endpoint: {}\n", feedback.source_endpoint));
+    text.push_str(&format!("target_role: {}\n", feedback.target_role));
+    text.push_str(&format!("request_id: {}\n", feedback.request_id));
+    text.push_str("delivery_mode: approval\n");
+    text.push_str(&format!("severity: {}\n", feedback.severity));
+    text.push_str(&format!("summary: {}\n", feedback.summary));
+    text.push_str("[ACP_MESSAGE_END]\n\n");
+    text.push_str(&format!("[Review from {}]\n", feedback.source_endpoint));
+    if !feedback.findings.is_empty() {
+        for finding in &feedback.findings {
+            text.push_str(&format!("- {}\n", finding));
+        }
+    } else {
+        text.push_str(&format!("- {}\n", feedback.summary));
+    }
+    if !feedback.actions.is_empty() {
+        text.push('\n');
+        text.push_str("Suggested actions:\n");
+        for action in &feedback.actions {
+            text.push_str(&format!("- {}\n", action));
+        }
+    }
+    if !feedback.notes.is_empty() {
+        text.push('\n');
+        text.push_str("Notes:\n");
+        for note in &feedback.notes {
+            text.push_str(&format!("- {}\n", note));
+        }
+    }
+    text
+}
+
+fn record_review_feedback_at(
+    root: &Path,
+    shared_id: &str,
+    raw_feedback: &str,
+    source_endpoint_override: Option<&str>,
+) -> io::Result<PersistedReviewFeedback> {
+    let _ = room_metadata_at(root, shared_id)?;
+    let feedback = parse_review_feedback(shared_id, raw_feedback, source_endpoint_override)?;
+    let text = render_review_feedback_text(&feedback);
+    let json_path = latest_review_feedback_json_path_in_root(root, shared_id);
+    let text_path = latest_review_feedback_text_path_in_root(root, shared_id);
+    write_json(&json_path, &feedback)?;
+    fs::write(&text_path, &text)?;
+    append_jsonl(
+        &review_feedback_history_jsonl_path_in_root(root, shared_id),
+        &feedback,
+    )?;
+    append_stream_event_at(
+        root,
+        ViewStreamKind::Events,
+        shared_id,
+        "review_feedback_recorded",
+        None,
+        format!(
+            "Recorded review feedback {} from {}",
+            feedback.request_id, feedback.source_endpoint
+        ),
+        json!({
+            "request_id": feedback.request_id,
+            "source_endpoint": feedback.source_endpoint,
+            "severity": feedback.severity,
+            "should_send": feedback.should_send,
+        }),
+    )?;
+    let (driver_envelope, driver_envelope_path) = if feedback.should_send {
+        let envelope = render_driver_feedback_envelope(&feedback);
+        let envelope_path = latest_driver_envelope_path_in_root(root, shared_id);
+        if let Some(parent) = envelope_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(&envelope_path, &envelope)?;
+        append_stream_event_at(
+            root,
+            ViewStreamKind::Events,
+            shared_id,
+            "review_feedback_ready_for_driver",
+            None,
+            format!("Prepared driver envelope for {}", feedback.request_id),
+            json!({
+                "request_id": feedback.request_id,
+                "target_role": feedback.target_role,
+                "envelope_path": envelope_path.display().to_string(),
+            }),
+        )?;
+        (Some(envelope), Some(envelope_path))
+    } else {
+        (None, None)
+    };
+    Ok(PersistedReviewFeedback {
+        feedback,
+        text,
+        json_path,
+        text_path,
+        driver_envelope,
+        driver_envelope_path,
     })
 }
 
@@ -419,6 +1049,27 @@ pub(crate) fn follow_stream(shared_id: &str, stream: ViewStreamKind) -> io::Resu
     }
 }
 
+pub(crate) fn prepare_review_request(shared_id: &str) -> io::Result<PersistedReviewRequest> {
+    prepare_review_request_at(
+        &room_id_root(),
+        shared_id,
+        Some("manual_request_from_room_stream"),
+    )
+}
+
+pub(crate) fn record_review_feedback(
+    shared_id: &str,
+    raw_feedback: &str,
+    source_endpoint_override: Option<&str>,
+) -> io::Result<PersistedReviewFeedback> {
+    record_review_feedback_at(
+        &room_id_root(),
+        shared_id,
+        raw_feedback,
+        source_endpoint_override,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -474,5 +1125,122 @@ mod tests {
         assert!(raw_log.contains("Tracked a modified file"));
         assert!(raw_jsonl.contains("\"file_changed\""));
         assert!(raw_jsonl.contains("\"src/main.rs\""));
+    }
+
+    #[test]
+    fn prepares_review_request_from_room_streams() {
+        let temp = tempdir().unwrap();
+        let shared_id = "review-room";
+        let participant = register_participant_at(
+            temp.path(),
+            shared_id,
+            AgentPersona::Claude,
+            Path::new("/tmp/repo"),
+        )
+        .unwrap();
+
+        append_stream_event_at(
+            temp.path(),
+            ViewStreamKind::Events,
+            shared_id,
+            "tool_call",
+            Some(&participant.endpoint),
+            "Bash(cargo test -p zellij-server)".to_owned(),
+            json!({
+                "tool": "Bash",
+                "value": "cargo test -p zellij-server",
+            }),
+        )
+        .unwrap();
+        append_stream_event_at(
+            temp.path(),
+            ViewStreamKind::Code,
+            shared_id,
+            "file_hint",
+            Some(&participant.endpoint),
+            "Detected file hint src/main.rs".to_owned(),
+            json!({
+                "file_path": "src/main.rs",
+            }),
+        )
+        .unwrap();
+        append_stream_event_at(
+            temp.path(),
+            ViewStreamKind::Code,
+            shared_id,
+            "pane_snapshot",
+            Some(&participant.endpoint),
+            "Pane terminal_1 viewport updated".to_owned(),
+            json!({
+                "pane_id": "terminal_1",
+                "viewport": ["fn main() {", "    println!(\"hi\");", "}"],
+            }),
+        )
+        .unwrap();
+
+        let persisted =
+            prepare_review_request_at(temp.path(), shared_id, Some("driver_turn_closed")).unwrap();
+
+        assert_eq!(persisted.request.reason, "driver_turn_closed");
+        assert_eq!(persisted.request.changed_files, vec!["src/main.rs"]);
+        assert_eq!(
+            persisted.request.last_commands,
+            vec!["cargo test -p zellij-server"]
+        );
+        assert!(persisted
+            .request
+            .recent_code_snapshot
+            .contains(&"fn main() {".to_owned()));
+        assert!(persisted.text.contains("[ACP_REVIEW_REQUEST_BEGIN]"));
+        assert!(persisted.json_path.exists());
+        assert!(persisted.text_path.exists());
+    }
+
+    #[test]
+    fn records_review_feedback_and_prepares_driver_envelope() {
+        let temp = tempdir().unwrap();
+        let shared_id = "feedback-room";
+        register_participant_at(
+            temp.path(),
+            shared_id,
+            AgentPersona::Reviewer,
+            Path::new("/tmp/repo"),
+        )
+        .unwrap();
+
+        let raw_feedback = r#"
+[ACP_REVIEW_RESPONSE_V1]
+room_id: feedback-room
+request_id: rr-0001
+source_endpoint: reviewer-7c31
+target_role: driver
+severity: medium
+confidence: high
+should_send: true
+summary: 缺少回归测试。
+
+findings:
+- 当前没有 focused regression test。
+
+actions:
+- 补一条 focused regression test。
+
+notes:
+- 改动面比较小。
+[/ACP_REVIEW_RESPONSE_V1]
+"#;
+
+        let persisted =
+            record_review_feedback_at(temp.path(), shared_id, raw_feedback, None).unwrap();
+
+        assert_eq!(persisted.feedback.request_id, "rr-0001");
+        assert!(persisted.text.contains("[ACP_REVIEW_RESPONSE_V1]"));
+        assert!(persisted.driver_envelope.is_some());
+        assert!(persisted
+            .driver_envelope
+            .as_deref()
+            .unwrap()
+            .contains("[ACP_MESSAGE_BEGIN]"));
+        assert!(persisted.driver_envelope_path.unwrap().exists());
     }
 }

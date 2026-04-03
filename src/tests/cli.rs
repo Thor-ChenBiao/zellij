@@ -1,7 +1,7 @@
 use std::net::{IpAddr, Ipv4Addr};
 
 use clap::{CommandFactory, Parser};
-use zellij_utils::cli::{CliArgs, Command};
+use zellij_utils::cli::{CliArgs, Command, ReviewCli, ViewCli};
 
 #[test]
 fn verify_cli() {
@@ -123,5 +123,94 @@ fn web_cli_status_with_ip_and_port_works() {
         assert_eq!(web.port, Some(9000));
     } else {
         panic!("Expected Web command");
+    }
+}
+
+#[test]
+fn claude_room_command_without_id_works() {
+    let args = CliArgs::try_parse_from(["zellij", "claude"]);
+    assert!(args.is_ok());
+    if let Ok(CliArgs {
+        command: Some(Command::Claude(room)),
+        ..
+    }) = args
+    {
+        assert!(room.shared_id.is_none());
+    } else {
+        panic!("Expected Claude room command");
+    }
+}
+
+#[test]
+fn reviewer_room_command_with_id_works() {
+    let args = CliArgs::try_parse_from(["zellij", "reviewer", "team-42"]);
+    assert!(args.is_ok());
+    if let Ok(CliArgs {
+        command: Some(Command::Reviewer(room)),
+        ..
+    }) = args
+    {
+        assert_eq!(room.shared_id.as_deref(), Some("team-42"));
+    } else {
+        panic!("Expected Reviewer room command");
+    }
+}
+
+#[test]
+fn view_events_command_with_id_works() {
+    let args = CliArgs::try_parse_from(["zellij", "view", "events", "team-42"]);
+    assert!(args.is_ok());
+    if let Ok(CliArgs {
+        command: Some(Command::View(ViewCli::Events(room))),
+        ..
+    }) = args
+    {
+        assert_eq!(room.shared_id.as_deref(), Some("team-42"));
+    } else {
+        panic!("Expected view events command");
+    }
+}
+
+#[test]
+fn review_request_command_with_id_works() {
+    let args = CliArgs::try_parse_from(["zellij", "review", "request", "team-42"]);
+    assert!(args.is_ok());
+    if let Ok(CliArgs {
+        command: Some(Command::Review(ReviewCli::Request(room))),
+        ..
+    }) = args
+    {
+        assert_eq!(room.shared_id.as_deref(), Some("team-42"));
+    } else {
+        panic!("Expected review request command");
+    }
+}
+
+#[test]
+fn review_feedback_command_with_file_and_source_endpoint_works() {
+    let args = CliArgs::try_parse_from([
+        "zellij",
+        "review",
+        "feedback",
+        "team-42",
+        "--file",
+        "/tmp/review.txt",
+        "--source-endpoint",
+        "reviewer-1234",
+    ]);
+    assert!(args.is_ok());
+    if let Ok(CliArgs {
+        command: Some(Command::Review(ReviewCli::Feedback(feedback))),
+        ..
+    }) = args
+    {
+        assert_eq!(feedback.shared_id.as_deref(), Some("team-42"));
+        assert_eq!(
+            feedback.file.as_deref().and_then(|path| path.to_str()),
+            Some("/tmp/review.txt")
+        );
+        assert_eq!(feedback.source_endpoint.as_deref(), Some("reviewer-1234"));
+    } else {
+        panic!("Expected review feedback command");
     }
 }

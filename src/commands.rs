@@ -1,6 +1,6 @@
 use crate::agent_control_plane::{
-    append_stream_event, follow_stream, list_room_endpoints, register_participant, room_metadata,
-    AgentPersona, ViewStreamKind,
+    append_stream_event, follow_stream, list_room_endpoints, prepare_review_request,
+    record_review_feedback, register_participant, room_metadata, AgentPersona, ViewStreamKind,
 };
 use dialoguer::Confirm;
 use std::net::IpAddr;
@@ -368,6 +368,81 @@ pub(crate) fn view_shared_room(stream: ViewStreamKind, shared_id: Option<String>
     if let Err(e) = follow_stream(&shared_id, stream) {
         eprintln!("Failed to follow stream for '{}': {}", shared_id, e);
         process::exit(2);
+    }
+}
+
+fn resolve_shared_room_id(shared_id: Option<String>) -> String {
+    shared_id
+        .or_else(|| envs::get_session_name().ok())
+        .unwrap_or_else(|| {
+            eprintln!(
+                "Please provide a shared room ID, or run this command inside a Zellij session."
+            );
+            process::exit(2);
+        })
+}
+
+pub(crate) fn prepare_room_review_request(shared_id: Option<String>) {
+    let shared_id = resolve_shared_room_id(shared_id);
+    let persisted = prepare_review_request(&shared_id).unwrap_or_else(|e| {
+        eprintln!(
+            "Failed to prepare review request for shared room '{}': {}",
+            shared_id, e
+        );
+        process::exit(2);
+    });
+    println!("Request ID: {}", persisted.request.request_id);
+    if let Some(driver_endpoint) = persisted.request.driver_endpoint.as_deref() {
+        println!("Driver endpoint: {}", driver_endpoint);
+    }
+    println!("{}", persisted.text);
+    println!("Saved request JSON: {}", persisted.json_path.display());
+    println!("Saved request text: {}", persisted.text_path.display());
+}
+
+pub(crate) fn record_room_review_feedback(
+    shared_id: Option<String>,
+    file: Option<PathBuf>,
+    source_endpoint: Option<String>,
+) {
+    let shared_id = resolve_shared_room_id(shared_id);
+    let mut raw_feedback = String::new();
+    if let Some(file) = file {
+        raw_feedback = std::fs::read_to_string(&file).unwrap_or_else(|e| {
+            eprintln!("Failed to read feedback file '{}': {}", file.display(), e);
+            process::exit(2);
+        });
+    } else {
+        std::io::stdin()
+            .read_to_string(&mut raw_feedback)
+            .unwrap_or_else(|e| {
+                eprintln!("Failed to read feedback from stdin: {}", e);
+                process::exit(2);
+            });
+    }
+    if raw_feedback.trim().is_empty() {
+        eprintln!("No feedback content provided. Pass --file or pipe an ACP_REVIEW_RESPONSE_V1 block into stdin.");
+        process::exit(2);
+    }
+    let persisted = record_review_feedback(&shared_id, &raw_feedback, source_endpoint.as_deref())
+        .unwrap_or_else(|e| {
+            eprintln!(
+                "Failed to record review feedback for shared room '{}': {}",
+                shared_id, e
+            );
+            process::exit(2);
+        });
+    println!("Request ID: {}", persisted.feedback.request_id);
+    println!("Source endpoint: {}", persisted.feedback.source_endpoint);
+    println!(
+        "Will send to driver: {}",
+        persisted.driver_envelope.is_some()
+    );
+    println!("{}", persisted.text);
+    println!("Saved feedback JSON: {}", persisted.json_path.display());
+    println!("Saved feedback text: {}", persisted.text_path.display());
+    if let Some(driver_envelope_path) = persisted.driver_envelope_path {
+        println!("Saved driver envelope: {}", driver_envelope_path.display());
     }
 }
 

@@ -10,9 +10,11 @@
 
 - reviewer 的 room 身份、bootstrap prompt 和固定消息模板已经持久化
 - bridge 已经能够把真实 pane 活动写进 room 的 `events/code` 流
-- reviewer 自动消费 room 流并回注 driver 的闭环还没有完成
+- `zellij review request [id]` 已经能从真实 room 流生成结构化 request
+- `zellij review feedback [id]` 已经能记录 `ACP_REVIEW_RESPONSE_V1` 并准备 driver envelope
+- reviewer 自动消费 room 流并回注 driver pane 的闭环还没有完成
 
-所以这份协议文档现在仍然是“下一阶段的实现合同”，不是说全部已经落到代码里了。
+所以这份协议文档现在是“部分已实现，部分仍是下一阶段合同”的状态。
 
 ## 核心决策
 

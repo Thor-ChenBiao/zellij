@@ -26,10 +26,12 @@
 - `zellij-server` 已经开始把真实 pane 活动写进房间流
 - `view events` 会看到真实输入事件，以及从 PTY 输出中启发式提取的工具轨迹
 - `view code` 会看到文件线索和 pane viewport 快照
+- `zellij review request [id]` 已经能基于真实 room 流生成结构化 review request
+- `zellij review feedback [id]` 已经能记录 reviewer 的结构化反馈，并准备发回 driver 的 envelope
 
 这版仍然是基础版，但已经不再只是空骨架。
 bridge 已经开始镜像 pane 的实时输入、PTY 输出和 pane viewport 变化。
-下一阶段的重点会转向 reviewer 请求生成、人工批准和回注闭环。
+review request / feedback 的文件化闭环已经落地，下一阶段的重点会转向自动触发、人工批准和真正写回 pane 的闭环。
 
 进度记录：
 

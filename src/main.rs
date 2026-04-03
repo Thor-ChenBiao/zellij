@@ -48,6 +48,21 @@ fn main() {
         }
         std::process::exit(0);
     }
+    if let Some(Command::Review(review_cli)) = opts.command.clone() {
+        match review_cli {
+            zellij_utils::cli::ReviewCli::Request(room_cli) => {
+                commands::prepare_room_review_request(room_cli.shared_id)
+            },
+            zellij_utils::cli::ReviewCli::Feedback(feedback_cli) => {
+                commands::record_room_review_feedback(
+                    feedback_cli.shared_id,
+                    feedback_cli.file,
+                    feedback_cli.source_endpoint,
+                )
+            },
+        }
+        std::process::exit(0);
+    }
 
     {
         let config = Config::try_from(&opts).ok();

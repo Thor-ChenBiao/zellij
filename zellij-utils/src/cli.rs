@@ -130,6 +130,11 @@ pub enum Command {
     #[clap(subcommand)]
     View(ViewCli),
 
+    /// Generate and record review requests / feedback for a shared room
+    #[clap(name = "review")]
+    #[clap(subcommand)]
+    Review(ReviewCli),
+
     /// Setup zellij and check its configuration
     #[clap(name = "setup", value_parser)]
     Setup(Setup),
@@ -167,6 +172,29 @@ pub enum ViewCli {
     Events(RoomCli),
     /// Follow the room's code stream
     Code(RoomCli),
+}
+
+#[derive(Debug, Clone, Subcommand, Serialize, Deserialize)]
+pub enum ReviewCli {
+    /// Build a structured review request from the room's latest activity
+    Request(RoomCli),
+    /// Record reviewer feedback from a structured ACP response block
+    Feedback(ReviewFeedbackCli),
+}
+
+#[derive(Debug, Clone, Args, Serialize, Deserialize)]
+pub struct ReviewFeedbackCli {
+    /// Shared room ID. If omitted, uses the current Zellij session name.
+    #[clap(value_parser = validate_session)]
+    pub shared_id: Option<String>,
+
+    /// Read the ACP_REVIEW_RESPONSE_V1 block from a file instead of stdin
+    #[clap(short, long, value_parser)]
+    pub file: Option<PathBuf>,
+
+    /// Override the source endpoint if the response block omits it
+    #[clap(long, value_parser)]
+    pub source_endpoint: Option<String>,
 }
 
 #[derive(Debug, Parser, Clone, Serialize, Deserialize)]
