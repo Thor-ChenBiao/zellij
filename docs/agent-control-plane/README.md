@@ -32,6 +32,10 @@ Progress log:
 
 - [2026-04-03 progress](/Users/chenbiao/zellij/docs/agent-control-plane/progress/2026-04-03.md)
 
+Protocol docs:
+
+- [Reviewer autonomy and communication](/Users/chenbiao/zellij/docs/agent-control-plane/reviewer-protocol.md)
+
 Initial target providers:
 
 - Claude Code
