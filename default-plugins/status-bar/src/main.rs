@@ -35,8 +35,10 @@ const TO_NORMAL: Action = Action::SwitchToMode {
 #[derive(Default)]
 struct State {
     tabs: Vec<TabInfo>,
+    pane_manifest: PaneManifest,
     tip_name: String,
     mode_info: ModeInfo,
+    agent_control_shared_id: Option<String>,
     text_copy_destination: Option<CopyDestination>,
     display_system_clipboard_failure: bool,
     classic_ui: bool,
@@ -200,11 +202,15 @@ impl ZellijPlugin for State {
             .get("classic")
             .map(|c| c == "true")
             .unwrap_or(false);
+        self.agent_control_shared_id = get_session_environment_variables()
+            .get("ZELLIJ_AGENT_SHARED_ID")
+            .cloned();
         set_selectable(false);
         subscribe(&[
             EventType::ModeUpdate,
             EventType::TabUpdate,
             EventType::PaneUpdate,
+            EventType::SessionUpdate,
             EventType::CopyToClipboard,
             EventType::InputReceived,
             EventType::SystemClipboardFailure,
@@ -239,6 +245,25 @@ impl ZellijPlugin for State {
                     should_render = true;
                 }
                 self.tabs = tabs;
+            },
+            Event::PaneUpdate(pane_manifest) => {
+                if self.pane_manifest != pane_manifest {
+                    should_render = true;
+                }
+                self.pane_manifest = pane_manifest;
+            },
+            Event::SessionUpdate(session_infos, _) => {
+                let current_session_name = session_infos.iter().find_map(|session_info| {
+                    if session_info.is_current_session {
+                        Some(session_info.name.clone())
+                    } else {
+                        None
+                    }
+                });
+                if self.mode_info.session_name != current_session_name {
+                    should_render = true;
+                }
+                self.mode_info.session_name = current_session_name;
             },
             Event::CopyToClipboard(copy_destination) => {
                 match self.text_copy_destination {
@@ -287,11 +312,19 @@ impl ZellijPlugin for State {
                 PaletteColor::EightBit(color) => format!("\u{1b}[48;5;{}m\u{1b}[0K", color),
             };
             let active_tab = self.tabs.iter().find(|t| t.active);
+            let focused_pane = active_tab.and_then(|active_tab| {
+                self.pane_manifest
+                    .panes
+                    .get(&active_tab.position)
+                    .and_then(|panes| panes.iter().find(|pane| pane.is_focused && !pane.is_plugin))
+            });
             print!(
                 "{}{}",
                 one_line_ui(
                     &self.mode_info,
+                    self.agent_control_shared_id.as_deref(),
                     active_tab,
+                    focused_pane,
                     cols,
                     separator,
                     self.base_mode_is_locked,

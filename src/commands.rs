@@ -245,6 +245,75 @@ fn attach_create_command(session_name: String) -> Command {
     })
 }
 
+fn provider_command_for_persona(persona: AgentPersona) -> Option<&'static str> {
+    match persona {
+        AgentPersona::Claude => Some("claude"),
+        AgentPersona::Codex => Some("codex"),
+        AgentPersona::Gemini => Some("gemini"),
+        AgentPersona::Reviewer => None,
+    }
+}
+
+fn room_layout_string(shared_id: &str, provider_command: Option<&str>, cwd: &PathBuf) -> String {
+    let shared_id = serde_json::to_string(shared_id).unwrap_or_else(|_| "\"room\"".to_owned());
+    let cwd = serde_json::to_string(&cwd.display().to_string())
+        .unwrap_or_else(|_| "\".\"".to_owned());
+    match provider_command {
+        Some(provider_command) => {
+            let command =
+                serde_json::to_string(provider_command).unwrap_or_else(|_| "\"sh\"".to_owned());
+            format!(
+                "layout {{\n    tab name={} {{\n        pane command={} cwd={}\n    }}\n}}",
+                shared_id, command, cwd
+            )
+        },
+        None => format!(
+            "layout {{\n    tab name={} {{\n        pane cwd={}\n    }}\n}}",
+            shared_id, cwd
+        ),
+    }
+}
+
+fn spawn_provider_pane(
+    session_name: &str,
+    provider_command: &str,
+    cwd: PathBuf,
+    pane_name: Option<String>,
+) -> Result<(), String> {
+    dispatch_cli_action_to_session(
+        CliAction::NewPane {
+            direction: None,
+            command: vec![provider_command.to_owned()],
+            plugin: None,
+            cwd: Some(cwd),
+            floating: false,
+            in_place: false,
+            close_replaced_pane: false,
+            name: pane_name,
+            close_on_exit: false,
+            start_suspended: false,
+            configuration: None,
+            skip_plugin_cache: false,
+            x: None,
+            y: None,
+            width: None,
+            height: None,
+            pinned: None,
+            stacked: false,
+            blocking: false,
+            block_until_exit_success: false,
+            block_until_exit_failure: false,
+            block_until_exit: false,
+            unblock_condition: None,
+            near_current_pane: false,
+            borderless: Some(false),
+            tab_id: None,
+        },
+        session_name,
+        None,
+    )
+}
+
 pub(crate) fn start_shared_room(
     mut opts: CliArgs,
     persona: AgentPersona,
@@ -324,8 +393,43 @@ pub(crate) fn start_shared_room(
         );
     }
 
+    if let Some(provider_command) = provider_command_for_persona(persona) {
+        if participant.room_created {
+            opts.command = None;
+            opts.session = Some(shared_id.clone());
+            opts.layout = None;
+            opts.new_session_with_layout = None;
+            opts.layout_string = Some(room_layout_string(
+                &shared_id,
+                Some(provider_command),
+                &current_dir,
+            ));
+            start_client(opts);
+            return;
+        } else if let Err(e) = spawn_provider_pane(
+            &shared_id,
+            provider_command,
+            current_dir.clone(),
+            Some(participant.endpoint.label.clone()),
+        ) {
+            eprintln!(
+                "Failed to start {} pane in shared room '{}': {}",
+                provider_command, shared_id, e
+            );
+        }
+    }
+
     opts.session = None;
-    opts.command = Some(attach_create_command(shared_id));
+    opts.layout = None;
+    opts.new_session_with_layout = None;
+    if participant.room_created {
+        opts.session = Some(shared_id.clone());
+        opts.layout_string = Some(room_layout_string(&shared_id, None, &current_dir));
+        opts.command = None;
+    } else {
+        opts.layout_string = None;
+        opts.command = Some(attach_create_command(shared_id));
+    }
     start_client(opts);
 }
 
@@ -986,18 +1090,29 @@ fn attach_with_cli_client(
     session_name: &str,
     config: Option<Config>,
 ) {
-    let os_input = get_os_input(zellij_client::os_input_output::get_cli_client_os_input);
-    let get_current_dir = || std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    match Action::actions_from_cli(cli_action, Box::new(get_current_dir), config) {
-        Ok(actions) => {
-            zellij_client::cli_client::start_cli_client(Box::new(os_input), session_name, actions);
-            std::process::exit(0);
-        },
+    match dispatch_cli_action_to_session(cli_action, session_name, config) {
+        Ok(()) => std::process::exit(0),
         Err(e) => {
             eprintln!("{}", e);
             log::error!("Error sending action: {}", e);
             std::process::exit(2);
         },
+    }
+}
+
+fn dispatch_cli_action_to_session(
+    cli_action: zellij_utils::cli::CliAction,
+    session_name: &str,
+    config: Option<Config>,
+) -> Result<(), String> {
+    let os_input = get_os_input(zellij_client::os_input_output::get_cli_client_os_input);
+    let get_current_dir = || std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    match Action::actions_from_cli(cli_action, Box::new(get_current_dir), config) {
+        Ok(actions) => {
+            zellij_client::cli_client::start_cli_client(Box::new(os_input), session_name, actions);
+            Ok(())
+        },
+        Err(e) => Err(e.to_string()),
     }
 }
 

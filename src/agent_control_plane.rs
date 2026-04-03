@@ -11,6 +11,7 @@ use uuid::Uuid;
 use zellij_utils::consts::{VERSION, ZELLIJ_CACHE_DIR};
 
 const ROOM_SCHEMA_VERSION: u32 = 1;
+const ROOM_HINT_DIR: &str = "/tmp/zellij-agent-control-plane";
 const REVIEW_SCHEMA_VERSION: u32 = 1;
 const REVIEW_TARGET_ROLE: &str = "driver";
 
@@ -297,9 +298,15 @@ fn latest_driver_envelope_path_in_root(root: &Path, shared_id: &str) -> PathBuf 
     review_inbox_dir_in_root(root, shared_id).join("latest.txt")
 }
 
+fn room_hint_path(shared_id: &str) -> PathBuf {
+    PathBuf::from(ROOM_HINT_DIR).join(format!("{}.room", shared_id))
+}
+
 fn ensure_room_files(root: &Path, shared_id: &str, session_name: &str) -> io::Result<bool> {
     fs::create_dir_all(root.join(shared_id).join("endpoints"))?;
+    fs::create_dir_all(ROOM_HINT_DIR)?;
     let metadata_path = root.join(shared_id).join("room.json");
+    fs::write(room_hint_path(shared_id), format!("{}\n", session_name))?;
     if metadata_path.exists() {
         let raw = fs::read_to_string(&metadata_path)?;
         let mut metadata: RoomMetadata = serde_json::from_str(&raw).map_err(json_to_io_error)?;

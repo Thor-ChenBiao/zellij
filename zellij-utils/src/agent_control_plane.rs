@@ -9,6 +9,7 @@ use std::time::{Duration, SystemTime};
 use crate::consts::{VERSION, ZELLIJ_CACHE_DIR};
 
 const ROOM_SCHEMA_VERSION: u32 = 1;
+const ROOM_HINT_DIR: &str = "/tmp/zellij-agent-control-plane";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ViewStreamKind {
@@ -73,6 +74,10 @@ pub fn room_id_root() -> PathBuf {
 
 pub fn room_dir(shared_id: &str) -> PathBuf {
     room_id_root().join(shared_id)
+}
+
+pub fn room_hint_path(shared_id: &str) -> PathBuf {
+    PathBuf::from(ROOM_HINT_DIR).join(format!("{}.room", shared_id))
 }
 
 pub fn room_metadata_path(shared_id: &str) -> PathBuf {
@@ -149,7 +154,9 @@ pub fn room_exists(shared_id: &str) -> bool {
 
 pub fn ensure_room_files(shared_id: &str, session_name: &str) -> io::Result<bool> {
     fs::create_dir_all(room_endpoints_dir(shared_id))?;
+    fs::create_dir_all(ROOM_HINT_DIR)?;
     let metadata_path = room_metadata_path(shared_id);
+    fs::write(room_hint_path(shared_id), format!("{}\n", session_name))?;
     if metadata_path.exists() {
         let raw = fs::read_to_string(&metadata_path)?;
         let mut metadata: RoomMetadata = serde_json::from_str(&raw).map_err(json_to_io_error)?;

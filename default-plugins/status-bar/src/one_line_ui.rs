@@ -9,14 +9,16 @@ use zellij_tile::prelude::*;
 use zellij_tile_utils::palette_match;
 
 use crate::first_line::{to_char, KeyAction, KeyMode, KeyShortcut};
-use crate::second_line::{system_clipboard_error, text_copied_hint};
+use crate::second_line::{agent_control_plane_hint, system_clipboard_error, text_copied_hint};
 use crate::{action_key, action_key_group, color_elements, MORE_MSG, TO_NORMAL};
 use crate::{ColoredElements, LinePart};
 use unicode_width::UnicodeWidthStr;
 
 pub fn one_line_ui(
     help: &ModeInfo,
+    agent_control_shared_id: Option<&str>,
     tab_info: Option<&TabInfo>,
+    focused_pane: Option<&PaneInfo>,
     mut max_len: usize,
     separator: &str,
     base_mode_is_locked: bool,
@@ -28,6 +30,16 @@ pub fn one_line_ui(
     }
     if clipboard_failure {
         return system_clipboard_error(&help.style.colors);
+    }
+    if matches!(help.mode, InputMode::Normal | InputMode::Locked) {
+        if let Some(agent_control_hint) = agent_control_plane_hint(
+            help,
+            agent_control_shared_id,
+            focused_pane,
+            max_len,
+        ) {
+            return agent_control_hint;
+        }
     }
     let mut line_part_to_render = LinePart::default();
     let mut append = |line_part: &LinePart, max_len: &mut usize| {
