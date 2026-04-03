@@ -3,7 +3,6 @@ use ansi_term::{
     Color::{Fixed, RGB},
     Style,
 };
-use std::path::PathBuf;
 use zellij_tile::prelude::actions::Action;
 use zellij_tile::prelude::*;
 use zellij_tile_utils::palette_match;
@@ -52,76 +51,6 @@ fn locked_interface_indication(palette: Styling) -> LinePart {
         part: locked_styled_text.to_string(),
         len: locked_text_len,
     }
-}
-
-pub fn agent_control_plane_hint(
-    help: &ModeInfo,
-    shared_id: Option<&str>,
-    focused_pane: Option<&PaneInfo>,
-    max_width: usize,
-) -> Option<LinePart> {
-    let shared_id = shared_id.or(help.session_name.as_deref())?;
-    if !room_hint_exists(shared_id) && !is_agent_control_pane(focused_pane) {
-        return None;
-    }
-    let text_color = palette_match!(help.style.colors.text_unselected.base);
-    let full_hint = format!(
-        " ACP room: {} | add reviewer: zellij reviewer {}",
-        shared_id, shared_id
-    );
-    let medium_hint = format!(
-        " ACP room: {} | reviewer: zellij reviewer {}",
-        shared_id, shared_id
-    );
-    let short_hint = format!(" ACP {} | rv {}", shared_id, shared_id);
-    let fallback_hint = format!(" ACP {}", shared_id);
-    let hint = [full_hint, medium_hint, short_hint, fallback_hint]
-        .into_iter()
-        .find(|candidate| candidate.chars().count() <= max_width)
-        .unwrap_or_else(|| format!(" ACP {}", truncate_middle(shared_id, max_width.saturating_sub(5))));
-    Some(LinePart {
-        len: hint.chars().count(),
-        part: Style::new().fg(text_color).bold().paint(hint).to_string(),
-    })
-}
-
-fn room_hint_exists(session_name: &str) -> bool {
-    PathBuf::from("/tmp/zellij-agent-control-plane")
-        .join(format!("{}.room", session_name))
-        .exists()
-}
-
-fn is_agent_control_pane(focused_pane: Option<&PaneInfo>) -> bool {
-    let Some(focused_pane) = focused_pane else {
-        return false;
-    };
-    let command = focused_pane.terminal_command.as_deref().unwrap_or_default();
-    matches!(command, "claude" | "codex" | "gemini")
-        || focused_pane.title.contains("Claude Code")
-        || focused_pane.title.contains("Codex")
-        || focused_pane.title.contains("Gemini")
-        || focused_pane.title.contains("Reviewer")
-}
-
-fn truncate_middle(text: &str, max_len: usize) -> String {
-    if text.chars().count() <= max_len {
-        return text.to_owned();
-    }
-    if max_len <= 3 {
-        return "...".chars().take(max_len).collect();
-    }
-    let left_len = (max_len - 3) / 2;
-    let right_len = max_len - 3 - left_len;
-    let left: String = text.chars().take(left_len).collect();
-    let right: String = text
-        .chars()
-        .rev()
-        .take(right_len)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
-    format!("{}...{}", left, right)
 }
 
 fn add_shortcut(
@@ -423,9 +352,6 @@ fn best_effort_shortcut_list(help: &ModeInfo, tip: TipFn, max_len: usize) -> Lin
 }
 
 pub fn keybinds(help: &ModeInfo, tip_name: &str, max_width: usize) -> LinePart {
-    if let Some(agent_control_hint) = agent_control_plane_hint(help, None, None, max_width) {
-        return agent_control_hint;
-    }
     // It is assumed that there is at least one TIP data in the TIPS HasMap.
     let tip_body = TIPS
         .get(tip_name)
