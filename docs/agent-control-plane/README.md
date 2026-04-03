@@ -23,10 +23,13 @@
 - 房间和参与者元数据会持久化到 Zellij 的缓存目录
 - `reviewer` 会记录一份启动 bootstrap prompt 和固定的 review message template
 - `view events` 和 `view code` 会跟随房间自己的流文件
+- `zellij-server` 已经开始把真实 pane 活动写进房间流
+- `view events` 会看到真实输入事件，以及从 PTY 输出中启发式提取的工具轨迹
+- `view code` 会看到文件线索和 pane viewport 快照
 
-这版是有意保持为基础版。
-bridge 还没有真正镜像 pane 的实时输入输出，也还没有把 pane 内文件改动流接进来。
-下一阶段会把这些房间流真正接到 pane I/O 上。
+这版仍然是基础版，但已经不再只是空骨架。
+bridge 已经开始镜像 pane 的实时输入、PTY 输出和 pane viewport 变化。
+下一阶段的重点会转向 reviewer 请求生成、人工批准和回注闭环。
 
 进度记录：
 
@@ -97,6 +100,26 @@ bridge 是传输和路由层。
 - 暴露实时事件订阅能力
 - 允许程序化地向 pane 注入消息
 - 保持一份可回放的本地事件日志
+
+### 当前 bridge 实现到哪儿
+
+当前仓库里，bridge 已经完成了第一段真正有运行价值的接入：
+
+- `zellij-server` 会在 `screen.rs` 的关键路径上旁路记录 room telemetry
+- 输入侧已经接到：
+  - `WriteCharacter`
+  - `WriteToPaneId`
+  - `WriteKeyToPaneId`
+  - `Paste`
+- 输出侧已经接到：
+  - `PtyBytes`
+  - `PaneRenderReport`
+- 当前是启发式解析，不是 provider 原生协议：
+  - 从 PTY 文本里提取 `Bash(...)` / `Write(...)` / `Edit(...)` 等轨迹
+  - 从输出行里提取文件线索
+  - 从 pane viewport 变化里生成代码快照
+
+也就是说，`view events` / `view code` 现在已经能跟随真实 session 活动，而不是只看预留日志文件。
 
 ### 设计原则
 

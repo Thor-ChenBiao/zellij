@@ -10,6 +10,7 @@ pub mod output;
 pub mod panes;
 pub mod tab;
 
+mod agent_control_plane;
 mod background_jobs;
 mod global_async_runtime;
 mod logging_pipe;

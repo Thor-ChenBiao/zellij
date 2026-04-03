@@ -4,6 +4,16 @@
 
 目标是让 reviewer 的行为可预测、可组合，而不是靠“感觉”运作。
 
+## 当前实现状态
+
+截至这次实现：
+
+- reviewer 的 room 身份、bootstrap prompt 和固定消息模板已经持久化
+- bridge 已经能够把真实 pane 活动写进 room 的 `events/code` 流
+- reviewer 自动消费 room 流并回注 driver 的闭环还没有完成
+
+所以这份协议文档现在仍然是“下一阶段的实现合同”，不是说全部已经落到代码里了。
+
 ## 核心决策
 
 - reviewer 是 shared room 里的一个一等 endpoint

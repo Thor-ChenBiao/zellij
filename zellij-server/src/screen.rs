@@ -39,6 +39,8 @@ use std::time::{Duration, Instant};
 use crate::route::NotificationEnd;
 
 use log::{debug, warn};
+use serde_json::json;
+use zellij_utils::agent_control_plane::{append_session_stream_event, ViewStreamKind};
 use zellij_utils::data::{
     CommandOrPlugin, Direction, EventType, FloatingPaneCoordinates, GetFocusedPaneInfoResponse,
     KeyWithModifier, LayoutInfo, LayoutWithError, ListPanesResponse, ListTabsResponse,
@@ -66,6 +68,7 @@ use zellij_utils::{
     position::Position,
 };
 
+use crate::agent_control_plane::{sanitize_terminal_output, RoomTelemetry, StreamEmission};
 use crate::background_jobs::BackgroundJob;
 use crate::os_input_output::ResizeCache;
 use crate::pane_groups::PaneGroups;
@@ -1352,6 +1355,7 @@ pub(crate) struct Screen {
     cached_layouts: Vec<LayoutInfo>,
     cached_layout_errors: Vec<LayoutWithError>,
     pane_render_subscribers: HashMap<ClientId, PaneRenderSubscription>,
+    room_telemetry: RoomTelemetry,
     plugins_need_ansi_pane_contents: bool,
     background_plugin_subscriptions: HashMap<(PluginId, ClientId), HashSet<EventType>>,
 }
@@ -1453,6 +1457,7 @@ impl Screen {
             cached_layouts: vec![],
             cached_layout_errors: vec![],
             pane_render_subscribers: HashMap::new(),
+            room_telemetry: RoomTelemetry::default(),
             plugins_need_ansi_pane_contents: false,
             background_plugin_subscriptions: HashMap::new(),
         }
@@ -2013,6 +2018,7 @@ impl Screen {
             }
 
             let pane_render_report = output.drain_pane_render_report();
+            self.log_pane_render_report_to_room(&pane_render_report);
 
             // Subscriber delivery — gated behind is_empty() for zero overhead
             if !self.pane_render_subscribers.is_empty() {
@@ -4639,6 +4645,71 @@ impl Screen {
             }
         }
     }
+    fn append_room_emission(&self, emission: StreamEmission) {
+        if self.session_name.is_empty() {
+            return;
+        }
+        if let Err(err) = append_session_stream_event(
+            emission.stream,
+            &self.session_name,
+            &emission.kind,
+            emission.message,
+            emission.payload,
+        ) {
+            debug!(
+                "failed to append agent control plane emission for session {}: {}",
+                self.session_name, err
+            );
+        }
+    }
+    fn append_room_input_event(
+        &self,
+        kind: &str,
+        pane_id: Option<PaneId>,
+        client_id: Option<ClientId>,
+        raw_bytes: &[u8],
+        extra_payload: serde_json::Value,
+    ) {
+        if self.session_name.is_empty() {
+            return;
+        }
+        let sanitized = sanitize_terminal_output(raw_bytes).trim().to_owned();
+        if sanitized.is_empty()
+            || sanitized == String::from_utf8_lossy(BRACKETED_PASTE_BEGIN)
+            || sanitized == String::from_utf8_lossy(BRACKETED_PASTE_END)
+        {
+            return;
+        }
+        let _ = append_session_stream_event(
+            ViewStreamKind::Events,
+            &self.session_name,
+            kind,
+            format!(
+                "Input {}{}{}",
+                sanitized.chars().take(80).collect::<String>(),
+                if pane_id.is_some() { " -> " } else { "" },
+                pane_id
+                    .map(|pane_id| pane_id.to_string())
+                    .unwrap_or_else(String::new)
+            ),
+            json!({
+                "pane_id": pane_id.map(|pane_id| pane_id.to_string()),
+                "client_id": client_id,
+                "raw": sanitized,
+                "extra": extra_payload,
+            }),
+        );
+    }
+    fn log_pty_bytes_to_room(&mut self, terminal_id: u32, vte_bytes: &[u8]) {
+        for emission in self.room_telemetry.ingest_pty_bytes(terminal_id, vte_bytes) {
+            self.append_room_emission(emission);
+        }
+    }
+    fn log_pane_render_report_to_room(&mut self, report: &PaneRenderReport) {
+        for emission in self.room_telemetry.pane_render_emissions(report) {
+            self.append_room_emission(emission);
+        }
+    }
     fn subscribe_to_pane_renders(
         &mut self,
         subscriber_client_id: ClientId,
@@ -5054,6 +5125,7 @@ pub(crate) fn screen_thread_main(
 
         match event {
             ScreenInstruction::PtyBytes(pid, vte_bytes) => {
+                screen.log_pty_bytes_to_room(pid, &vte_bytes);
                 let all_tabs = screen.get_tabs_mut();
                 for tab in all_tabs.values_mut() {
                     if tab.has_terminal_pid(pid) {
@@ -5317,6 +5389,16 @@ pub(crate) fn screen_thread_main(
                 }
                 let mut state_changed = false;
                 let client_input_mode = screen.get_client_input_mode(client_id);
+                screen.append_room_input_event(
+                    "write_character",
+                    None,
+                    Some(client_id),
+                    &raw_bytes,
+                    json!({
+                        "input_mode": client_input_mode.map(|mode| format!("{:?}", mode)),
+                        "kitty_keyboard": is_kitty_keyboard_protocol,
+                    }),
+                );
                 match client_input_mode {
                     Some(InputMode::RenameTab) => {
                         if !(raw_bytes == BRACKETED_PASTE_BEGIN || raw_bytes == BRACKETED_PASTE_END)
@@ -8018,6 +8100,13 @@ pub(crate) fn screen_thread_main(
                 screen.render(None)?;
             },
             ScreenInstruction::WriteToPaneId(bytes, pane_id, _completion) => {
+                screen.append_room_input_event(
+                    "write_to_pane_id",
+                    Some(pane_id),
+                    None,
+                    &bytes,
+                    json!({}),
+                );
                 let all_tabs = screen.get_tabs_mut();
                 for tab in all_tabs.values_mut() {
                     if tab.has_pane_with_pid(&pane_id) {
@@ -8029,6 +8118,15 @@ pub(crate) fn screen_thread_main(
                 screen.render(None)?;
             },
             ScreenInstruction::Paste(bytes, pane_id, client_id, _completion) => {
+                screen.append_room_input_event(
+                    "paste",
+                    pane_id,
+                    Some(client_id),
+                    &bytes,
+                    json!({
+                        "byte_len": bytes.len(),
+                    }),
+                );
                 match pane_id {
                     Some(pane_id) => {
                         let all_tabs = screen.get_tabs_mut();
@@ -8070,6 +8168,16 @@ pub(crate) fn screen_thread_main(
                 pane_id,
                 _completion,
             ) => {
+                screen.append_room_input_event(
+                    "write_key_to_pane_id",
+                    Some(pane_id),
+                    None,
+                    &bytes,
+                    json!({
+                        "key": format!("{:?}", key_with_modifier),
+                        "kitty_keyboard": is_kitty,
+                    }),
+                );
                 let all_tabs = screen.get_tabs_mut();
                 for tab in all_tabs.values_mut() {
                     if tab.has_pane_with_pid(&pane_id) {

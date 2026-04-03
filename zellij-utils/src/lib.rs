@@ -20,6 +20,8 @@ pub mod shared;
 
 // The following modules can't be used when targeting wasm
 #[cfg(not(target_family = "wasm"))]
+pub mod agent_control_plane;
+#[cfg(not(target_family = "wasm"))]
 pub mod channels; // Requires tokio
 #[cfg(not(target_family = "wasm"))]
 pub mod common_path;
