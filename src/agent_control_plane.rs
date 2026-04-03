@@ -104,6 +104,7 @@ pub(crate) struct ReviewRequest {
     pub room_id: String,
     pub request_id: String,
     pub driver_endpoint: Option<String>,
+    pub target_pane_id: Option<String>,
     pub target_role: String,
     pub mode: String,
     pub reason: String,
@@ -147,6 +148,7 @@ pub(crate) struct PersistedReviewFeedback {
     pub text: String,
     pub json_path: PathBuf,
     pub text_path: PathBuf,
+    pub target_pane_id: Option<String>,
     pub driver_envelope: Option<String>,
     pub driver_envelope_path: Option<PathBuf>,
 }
@@ -482,6 +484,29 @@ fn synthesize_recent_code_snapshot(code_events: &[StreamEvent]) -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn event_target_pane_id(event: &StreamEvent) -> Option<String> {
+    event
+        .payload
+        .get("pane_id")
+        .and_then(|pane_id| pane_id.as_str())
+        .map(|pane_id| pane_id.to_owned())
+        .or_else(|| {
+            event
+                .payload
+                .get("terminal_id")
+                .and_then(|terminal_id| terminal_id.as_u64())
+                .map(|terminal_id| format!("terminal_{}", terminal_id))
+        })
+}
+
+fn infer_target_pane_id(events: &[StreamEvent], code_events: &[StreamEvent]) -> Option<String> {
+    code_events
+        .iter()
+        .rev()
+        .find_map(event_target_pane_id)
+        .or_else(|| events.iter().rev().find_map(event_target_pane_id))
+}
+
 fn render_list_section(title: &str, values: &[String]) -> String {
     let mut section = format!("{title}:\n");
     if values.is_empty() {
@@ -505,6 +530,13 @@ fn render_review_request_text(request: &ReviewRequest) -> String {
             .driver_endpoint
             .as_deref()
             .unwrap_or("<unknown-driver>")
+    ));
+    text.push_str(&format!(
+        "target_pane_id: {}\n",
+        request
+            .target_pane_id
+            .as_deref()
+            .unwrap_or("<unknown-pane>")
     ));
     text.push_str(&format!("target_role: {}\n", request.target_role));
     text.push_str(&format!("mode: {}\n", request.mode));
@@ -612,6 +644,7 @@ fn prepare_review_request_at(
         room_id: shared_id.to_owned(),
         request_id: next_review_request_id(root, shared_id),
         driver_endpoint,
+        target_pane_id: infer_target_pane_id(&events, &code_events),
         target_role: REVIEW_TARGET_ROLE.to_owned(),
         mode: "approval".to_owned(),
         reason: reason
@@ -643,6 +676,7 @@ fn prepare_review_request_at(
         json!({
             "request_id": request.request_id,
             "driver_endpoint": request.driver_endpoint,
+            "target_pane_id": request.target_pane_id,
             "changed_files": request.changed_files,
             "last_commands": request.last_commands,
         }),
@@ -855,6 +889,51 @@ fn render_driver_feedback_envelope(feedback: &ReviewFeedback) -> String {
     text
 }
 
+fn find_review_request_by_id(
+    root: &Path,
+    shared_id: &str,
+    request_id: &str,
+) -> io::Result<Option<ReviewRequest>> {
+    let latest_path = latest_review_request_json_path_in_root(root, shared_id);
+    if latest_path.exists() {
+        let raw = fs::read_to_string(&latest_path)?;
+        let latest: ReviewRequest = serde_json::from_str(&raw).map_err(json_to_io_error)?;
+        if latest.request_id == request_id {
+            return Ok(Some(latest));
+        }
+    }
+    let history_path = review_request_history_jsonl_path_in_root(root, shared_id);
+    if !history_path.exists() {
+        return Ok(None);
+    }
+    let raw = fs::read_to_string(history_path)?;
+    for line in raw.lines().rev() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let request: ReviewRequest = serde_json::from_str(line).map_err(json_to_io_error)?;
+        if request.request_id == request_id {
+            return Ok(Some(request));
+        }
+    }
+    Ok(None)
+}
+
+fn resolve_feedback_target_pane_id(
+    root: &Path,
+    shared_id: &str,
+    request_id: &str,
+) -> io::Result<Option<String>> {
+    if let Some(request) = find_review_request_by_id(root, shared_id, request_id)? {
+        if request.target_pane_id.is_some() {
+            return Ok(request.target_pane_id);
+        }
+    }
+    let events = read_stream_events_at(root, shared_id, ViewStreamKind::Events)?;
+    let code_events = read_stream_events_at(root, shared_id, ViewStreamKind::Code)?;
+    Ok(infer_target_pane_id(&events, &code_events))
+}
+
 fn record_review_feedback_at(
     root: &Path,
     shared_id: &str,
@@ -889,6 +968,11 @@ fn record_review_feedback_at(
             "should_send": feedback.should_send,
         }),
     )?;
+    let target_pane_id = if feedback.should_send {
+        resolve_feedback_target_pane_id(root, shared_id, &feedback.request_id)?
+    } else {
+        None
+    };
     let (driver_envelope, driver_envelope_path) = if feedback.should_send {
         let envelope = render_driver_feedback_envelope(&feedback);
         let envelope_path = latest_driver_envelope_path_in_root(root, shared_id);
@@ -906,6 +990,7 @@ fn record_review_feedback_at(
             json!({
                 "request_id": feedback.request_id,
                 "target_role": feedback.target_role,
+                "target_pane_id": target_pane_id,
                 "envelope_path": envelope_path.display().to_string(),
             }),
         )?;
@@ -918,6 +1003,7 @@ fn record_review_feedback_at(
         text,
         json_path,
         text_path,
+        target_pane_id,
         driver_envelope,
         driver_envelope_path,
     })
@@ -1184,6 +1270,10 @@ mod tests {
         assert_eq!(persisted.request.reason, "driver_turn_closed");
         assert_eq!(persisted.request.changed_files, vec!["src/main.rs"]);
         assert_eq!(
+            persisted.request.target_pane_id.as_deref(),
+            Some("terminal_1")
+        );
+        assert_eq!(
             persisted.request.last_commands,
             vec!["cargo test -p zellij-server"]
         );
@@ -1200,13 +1290,27 @@ mod tests {
     fn records_review_feedback_and_prepares_driver_envelope() {
         let temp = tempdir().unwrap();
         let shared_id = "feedback-room";
-        register_participant_at(
+        let participant = register_participant_at(
             temp.path(),
             shared_id,
-            AgentPersona::Reviewer,
+            AgentPersona::Claude,
             Path::new("/tmp/repo"),
         )
         .unwrap();
+        append_stream_event_at(
+            temp.path(),
+            ViewStreamKind::Code,
+            shared_id,
+            "pane_snapshot",
+            Some(&participant.endpoint),
+            "Pane terminal_1 viewport updated".to_owned(),
+            json!({
+                "pane_id": "terminal_1",
+                "viewport": ["fn main() {", "}"],
+            }),
+        )
+        .unwrap();
+        prepare_review_request_at(temp.path(), shared_id, Some("driver_turn_closed")).unwrap();
 
         let raw_feedback = r#"
 [ACP_REVIEW_RESPONSE_V1]
@@ -1234,6 +1338,7 @@ notes:
             record_review_feedback_at(temp.path(), shared_id, raw_feedback, None).unwrap();
 
         assert_eq!(persisted.feedback.request_id, "rr-0001");
+        assert_eq!(persisted.target_pane_id.as_deref(), Some("terminal_1"));
         assert!(persisted.text.contains("[ACP_REVIEW_RESPONSE_V1]"));
         assert!(persisted.driver_envelope.is_some());
         assert!(persisted

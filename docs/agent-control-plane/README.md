@@ -28,10 +28,12 @@
 - `view code` 会看到文件线索和 pane viewport 快照
 - `zellij review request [id]` 已经能基于真实 room 流生成结构化 review request
 - `zellij review feedback [id]` 已经能记录 reviewer 的结构化反馈，并准备发回 driver 的 envelope
+- 当 room 里能解析出目标 pane 时，`zellij review feedback [id]` 会尝试把 envelope 直接回注到 driver pane
 
 这版仍然是基础版，但已经不再只是空骨架。
 bridge 已经开始镜像 pane 的实时输入、PTY 输出和 pane viewport 变化。
-review request / feedback 的文件化闭环已经落地，下一阶段的重点会转向自动触发、人工批准和真正写回 pane 的闭环。
+review request / feedback 的文件化闭环已经落地，driver pane 的自动回注也已经有第一版启发式实现。
+下一阶段的重点会转向自动触发、更稳的 endpoint-pipe 绑定和人工批准闭环。
 
 进度记录：
 

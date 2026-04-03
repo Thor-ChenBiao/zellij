@@ -42,8 +42,8 @@ use miette::{Report, Result};
 use serde_json::json;
 use zellij_server::{os_input_output::get_server_os_input, start_server as start_server_impl};
 use zellij_utils::{
-    cli::{CliArgs, Command, SessionCommand, Sessions},
-    data::ConnectToSession,
+    cli::{CliAction, CliArgs, Command, SessionCommand, Sessions},
+    data::{ConnectToSession, ListPanesResponse},
     envs,
     input::{
         actions::Action,
@@ -382,6 +382,115 @@ fn resolve_shared_room_id(shared_id: Option<String>) -> String {
         })
 }
 
+fn format_terminal_pane_id(id: u32, is_plugin: bool) -> String {
+    if is_plugin {
+        format!("plugin_{}", id)
+    } else {
+        format!("terminal_{}", id)
+    }
+}
+
+fn room_session_is_active(session_name: &str) -> bool {
+    get_sessions()
+        .unwrap_or_default()
+        .iter()
+        .any(|session| session.0 == session_name)
+}
+
+fn list_session_panes(session_name: &str) -> std::result::Result<ListPanesResponse, String> {
+    let current_exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let output = process::Command::new(current_exe)
+        .arg("--session")
+        .arg(session_name)
+        .arg("action")
+        .arg("list-panes")
+        .arg("--json")
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        if stderr.is_empty() {
+            Err(format!("list-panes failed with status {}", output.status))
+        } else {
+            Err(stderr)
+        }
+    } else {
+        serde_json::from_slice(&output.stdout).map_err(|e| e.to_string())
+    }
+}
+
+fn resolve_driver_delivery_pane(
+    session_name: &str,
+    preferred_pane_id: Option<&str>,
+) -> std::result::Result<Option<String>, String> {
+    let panes = list_session_panes(session_name)?;
+    if let Some(preferred_pane_id) = preferred_pane_id {
+        if panes.iter().any(|entry| {
+            format_terminal_pane_id(entry.pane_info.id, entry.pane_info.is_plugin)
+                == preferred_pane_id
+        }) {
+            return Ok(Some(preferred_pane_id.to_owned()));
+        }
+    }
+    let terminal_panes: Vec<String> = panes
+        .iter()
+        .filter(|entry| !entry.pane_info.is_plugin && !entry.pane_info.is_suppressed)
+        .map(|entry| format_terminal_pane_id(entry.pane_info.id, false))
+        .collect();
+    if terminal_panes.len() == 1 {
+        Ok(terminal_panes.into_iter().next())
+    } else {
+        Ok(None)
+    }
+}
+
+fn run_cli_action_in_session(
+    session_name: &str,
+    cli_action: CliAction,
+) -> std::result::Result<(), String> {
+    let os_input = get_os_input(zellij_client::os_input_output::get_cli_client_os_input);
+    let get_current_dir = || std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let actions = Action::actions_from_cli(cli_action, Box::new(get_current_dir), None)?;
+    zellij_client::cli_client::start_cli_client(Box::new(os_input), session_name, actions);
+    Ok(())
+}
+
+fn inject_review_feedback_into_driver(
+    shared_id: &str,
+    pane_id: &str,
+    envelope: &str,
+    request_id: &str,
+    source_endpoint: &str,
+) -> std::result::Result<(), String> {
+    run_cli_action_in_session(
+        shared_id,
+        CliAction::Paste {
+            chars: envelope.to_owned(),
+            pane_id: Some(pane_id.to_owned()),
+        },
+    )?;
+    run_cli_action_in_session(
+        shared_id,
+        CliAction::SendKeys {
+            keys: vec!["Enter".to_owned()],
+            pane_id: Some(pane_id.to_owned()),
+        },
+    )?;
+    let _ = append_stream_event(
+        ViewStreamKind::Events,
+        shared_id,
+        "review_feedback_injected_to_driver",
+        None,
+        format!("Injected review feedback {} into {}", request_id, pane_id),
+        json!({
+            "request_id": request_id,
+            "target_pane_id": pane_id,
+            "source_endpoint": source_endpoint,
+        }),
+    );
+    Ok(())
+}
+
 pub(crate) fn prepare_room_review_request(shared_id: Option<String>) {
     let shared_id = resolve_shared_room_id(shared_id);
     let persisted = prepare_review_request(&shared_id).unwrap_or_else(|e| {
@@ -394,6 +503,9 @@ pub(crate) fn prepare_room_review_request(shared_id: Option<String>) {
     println!("Request ID: {}", persisted.request.request_id);
     if let Some(driver_endpoint) = persisted.request.driver_endpoint.as_deref() {
         println!("Driver endpoint: {}", driver_endpoint);
+    }
+    if let Some(target_pane_id) = persisted.request.target_pane_id.as_deref() {
+        println!("Target pane: {}", target_pane_id);
     }
     println!("{}", persisted.text);
     println!("Saved request JSON: {}", persisted.json_path.display());
@@ -438,11 +550,90 @@ pub(crate) fn record_room_review_feedback(
         "Will send to driver: {}",
         persisted.driver_envelope.is_some()
     );
+    if let Some(target_pane_id) = persisted.target_pane_id.as_deref() {
+        println!("Target pane: {}", target_pane_id);
+    }
     println!("{}", persisted.text);
     println!("Saved feedback JSON: {}", persisted.json_path.display());
     println!("Saved feedback text: {}", persisted.text_path.display());
     if let Some(driver_envelope_path) = persisted.driver_envelope_path {
         println!("Saved driver envelope: {}", driver_envelope_path.display());
+    }
+    if let Some(driver_envelope) = persisted.driver_envelope.as_deref() {
+        if room_session_is_active(&shared_id) {
+            match resolve_driver_delivery_pane(&shared_id, persisted.target_pane_id.as_deref()) {
+                Ok(Some(target_pane_id)) => {
+                    inject_review_feedback_into_driver(
+                        &shared_id,
+                        &target_pane_id,
+                        driver_envelope,
+                        &persisted.feedback.request_id,
+                        &persisted.feedback.source_endpoint,
+                    )
+                    .unwrap_or_else(|e| {
+                        eprintln!("Failed to inject driver envelope: {}", e);
+                        process::exit(2);
+                    });
+                    println!("Injected driver envelope into: {}", target_pane_id);
+                },
+                Ok(None) => {
+                    let _ = append_stream_event(
+                        ViewStreamKind::Events,
+                        &shared_id,
+                        "review_feedback_waiting_for_driver_delivery",
+                        None,
+                        format!(
+                            "Feedback {} is waiting for driver delivery",
+                            persisted.feedback.request_id
+                        ),
+                        json!({
+                            "request_id": persisted.feedback.request_id,
+                            "target_pane_id": persisted.target_pane_id,
+                            "reason": "target_pane_not_resolved",
+                        }),
+                    );
+                    println!(
+                        "Driver pane not resolved. Envelope kept on disk for manual delivery."
+                    );
+                },
+                Err(e) => {
+                    let _ = append_stream_event(
+                        ViewStreamKind::Events,
+                        &shared_id,
+                        "review_feedback_waiting_for_driver_delivery",
+                        None,
+                        format!(
+                            "Feedback {} is waiting for driver delivery",
+                            persisted.feedback.request_id
+                        ),
+                        json!({
+                            "request_id": persisted.feedback.request_id,
+                            "target_pane_id": persisted.target_pane_id,
+                            "reason": "pane_query_failed",
+                            "error": e,
+                        }),
+                    );
+                    println!("Could not inspect session panes yet. Envelope kept on disk.");
+                },
+            }
+        } else {
+            let _ = append_stream_event(
+                ViewStreamKind::Events,
+                &shared_id,
+                "review_feedback_waiting_for_driver_delivery",
+                None,
+                format!(
+                    "Feedback {} is waiting for driver delivery",
+                    persisted.feedback.request_id
+                ),
+                json!({
+                    "request_id": persisted.feedback.request_id,
+                    "target_pane_id": persisted.target_pane_id,
+                    "reason": "session_not_active",
+                }),
+            );
+            println!("Room session is not active. Envelope kept on disk.");
+        }
     }
 }
 
