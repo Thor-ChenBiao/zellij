@@ -48,6 +48,8 @@ pub struct EndpointMetadata {
     pub cwd: String,
     pub pid: u32,
     pub created_at: String,
+    pub bound_pane_id: Option<String>,
+    pub bound_pane_id_updated_at: Option<String>,
     pub reviewer_bootstrap_prompt: Option<String>,
     pub review_message_template: Option<String>,
 }

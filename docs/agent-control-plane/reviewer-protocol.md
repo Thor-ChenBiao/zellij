@@ -13,6 +13,7 @@
 - `zellij review request [id]` 已经能从真实 room 流生成结构化 request
 - `zellij review feedback [id]` 已经能记录 `ACP_REVIEW_RESPONSE_V1` 并准备 driver envelope
 - `zellij review feedback [id]` 在能定位目标 pane 时，已经会尝试把 envelope 直接回注到 driver pane
+- request 生成时，bridge 会把当前推断出的 `target_pane_id` 回写到 driver endpoint 元数据里，作为后续回注的优先绑定
 - reviewer 自动消费 room 流并自主触发整个回注闭环还没有完成
 
 所以这份协议文档现在是“部分已实现，部分仍是下一阶段合同”的状态。

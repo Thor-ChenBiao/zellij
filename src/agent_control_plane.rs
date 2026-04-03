@@ -87,6 +87,8 @@ pub(crate) struct EndpointMetadata {
     pub cwd: String,
     pub pid: u32,
     pub created_at: String,
+    pub bound_pane_id: Option<String>,
+    pub bound_pane_id_updated_at: Option<String>,
     pub reviewer_bootstrap_prompt: Option<String>,
     pub review_message_template: Option<String>,
 }
@@ -349,6 +351,8 @@ fn register_participant_at(
         cwd: cwd.display().to_string(),
         pid: std::process::id(),
         created_at: now_string(),
+        bound_pane_id: None,
+        bound_pane_id_updated_at: None,
         reviewer_bootstrap_prompt: (persona == AgentPersona::Reviewer)
             .then(|| reviewer_bootstrap_prompt(shared_id, &session_name)),
         review_message_template: (persona == AgentPersona::Reviewer)
@@ -416,6 +420,26 @@ fn list_room_endpoints_at(root: &Path, shared_id: &str) -> io::Result<Vec<Endpoi
     }
     endpoints.sort_by(|a, b| a.created_at.cmp(&b.created_at));
     Ok(endpoints)
+}
+
+fn update_endpoint_pane_binding_at(
+    root: &Path,
+    shared_id: &str,
+    endpoint_id: &str,
+    pane_id: &str,
+) -> io::Result<()> {
+    let endpoint_path = endpoint_metadata_path_in_root(root, shared_id, endpoint_id);
+    if !endpoint_path.exists() {
+        return Ok(());
+    }
+    let raw = fs::read_to_string(&endpoint_path)?;
+    let mut endpoint: EndpointMetadata = serde_json::from_str(&raw).map_err(json_to_io_error)?;
+    if endpoint.bound_pane_id.as_deref() == Some(pane_id) {
+        return Ok(());
+    }
+    endpoint.bound_pane_id = Some(pane_id.to_owned());
+    endpoint.bound_pane_id_updated_at = Some(now_string());
+    write_json(&endpoint_path, &endpoint)
 }
 
 fn append_jsonl<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
@@ -657,6 +681,12 @@ fn prepare_review_request_at(
         task: "Review 最新的 driver 活动。只返回一个 ACP_REVIEW_RESPONSE_V1 block。".to_owned(),
         created_at: now_string(),
     };
+    if let (Some(driver_endpoint), Some(target_pane_id)) = (
+        request.driver_endpoint.as_deref(),
+        request.target_pane_id.as_deref(),
+    ) {
+        update_endpoint_pane_binding_at(root, shared_id, driver_endpoint, target_pane_id)?;
+    }
     let text = render_review_request_text(&request);
     let json_path = latest_review_request_json_path_in_root(root, shared_id);
     let text_path = latest_review_request_text_path_in_root(root, shared_id);
@@ -927,6 +957,16 @@ fn resolve_feedback_target_pane_id(
     if let Some(request) = find_review_request_by_id(root, shared_id, request_id)? {
         if request.target_pane_id.is_some() {
             return Ok(request.target_pane_id);
+        }
+        if let Some(driver_endpoint) = request.driver_endpoint.as_deref() {
+            let endpoints = list_room_endpoints_at(root, shared_id)?;
+            if let Some(bound_pane_id) = endpoints
+                .iter()
+                .find(|endpoint| endpoint.endpoint_id == driver_endpoint)
+                .and_then(|endpoint| endpoint.bound_pane_id.clone())
+            {
+                return Ok(Some(bound_pane_id));
+            }
         }
     }
     let events = read_stream_events_at(root, shared_id, ViewStreamKind::Events)?;
@@ -1266,6 +1306,11 @@ mod tests {
 
         let persisted =
             prepare_review_request_at(temp.path(), shared_id, Some("driver_turn_closed")).unwrap();
+        let endpoints = list_room_endpoints_at(temp.path(), shared_id).unwrap();
+        let driver_endpoint = endpoints
+            .iter()
+            .find(|endpoint| endpoint.role == REVIEW_TARGET_ROLE)
+            .unwrap();
 
         assert_eq!(persisted.request.reason, "driver_turn_closed");
         assert_eq!(persisted.request.changed_files, vec!["src/main.rs"]);
@@ -1273,6 +1318,7 @@ mod tests {
             persisted.request.target_pane_id.as_deref(),
             Some("terminal_1")
         );
+        assert_eq!(driver_endpoint.bound_pane_id.as_deref(), Some("terminal_1"));
         assert_eq!(
             persisted.request.last_commands,
             vec!["cargo test -p zellij-server"]

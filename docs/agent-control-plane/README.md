@@ -29,6 +29,7 @@
 - `zellij review request [id]` 已经能基于真实 room 流生成结构化 review request
 - `zellij review feedback [id]` 已经能记录 reviewer 的结构化反馈，并准备发回 driver 的 envelope
 - 当 room 里能解析出目标 pane 时，`zellij review feedback [id]` 会尝试把 envelope 直接回注到 driver pane
+- request 生成时，系统会把当前推断出的 driver `pane_id` 持久化到 endpoint 元数据，供后续 feedback 回注优先使用
 
 这版仍然是基础版，但已经不再只是空骨架。
 bridge 已经开始镜像 pane 的实时输入、PTY 输出和 pane viewport 变化。
