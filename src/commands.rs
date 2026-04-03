@@ -1,6 +1,7 @@
 use crate::agent_control_plane::{
     append_stream_event, follow_stream, list_room_endpoints, prepare_review_request,
-    record_review_feedback, register_participant, room_metadata, AgentPersona, ViewStreamKind,
+    record_review_feedback, register_participant, room_metadata, AgentPersona, EndpointMetadata,
+    ViewStreamKind,
 };
 use dialoguer::Confirm;
 use std::net::IpAddr;
@@ -254,22 +255,85 @@ fn provider_command_for_persona(persona: AgentPersona) -> Option<&'static str> {
     }
 }
 
-fn room_layout_string(shared_id: &str, provider_command: Option<&str>, cwd: &PathBuf) -> String {
-    let shared_id = serde_json::to_string(shared_id).unwrap_or_else(|_| "\"room\"".to_owned());
-    let cwd = serde_json::to_string(&cwd.display().to_string())
-        .unwrap_or_else(|_| "\".\"".to_owned());
+#[derive(Debug, Clone, Copy, Default)]
+struct RoomRoleCounts {
+    driver_count: usize,
+    reviewer_count: usize,
+    human_count: usize,
+}
+
+fn kdl_string(value: &str) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_owned())
+}
+
+fn count_room_roles(endpoints: &[EndpointMetadata]) -> RoomRoleCounts {
+    let mut counts = RoomRoleCounts::default();
+    for endpoint in endpoints {
+        match endpoint.role.as_str() {
+            "driver" => counts.driver_count += 1,
+            "reviewer" => counts.reviewer_count += 1,
+            "human" => counts.human_count += 1,
+            _ => {},
+        }
+    }
+    counts
+}
+
+fn send_acp_room_state_to_session(
+    session_name: &str,
+    shared_id: &str,
+) -> std::result::Result<(), String> {
+    let endpoints = list_room_endpoints(shared_id).map_err(|e| e.to_string())?;
+    let counts = count_room_roles(&endpoints);
+    let payload = serde_json::to_string(&json!({
+        "room_id": shared_id,
+        "driver_count": counts.driver_count,
+        "reviewer_count": counts.reviewer_count,
+        "human_count": counts.human_count,
+    }))
+    .map_err(|e| e.to_string())?;
+    run_cli_action_in_session(
+        session_name,
+        CliAction::Pipe {
+            name: Some("acp-room-state".to_owned()),
+            payload: Some(payload),
+            args: None,
+            plugin: None,
+            plugin_configuration: None,
+            force_launch_plugin: false,
+            skip_plugin_cache: false,
+            floating_plugin: None,
+            in_place_plugin: None,
+            plugin_cwd: None,
+            plugin_title: None,
+        },
+    )
+}
+
+fn room_layout_string(
+    shared_id: &str,
+    provider_command: Option<&str>,
+    cwd: &PathBuf,
+    endpoint: &EndpointMetadata,
+    role_counts: RoomRoleCounts,
+) -> String {
+    let shared_id = kdl_string(shared_id);
+    let cwd = kdl_string(&cwd.display().to_string());
+    let self_provider = kdl_string(&endpoint.provider);
+    let self_role = kdl_string(&endpoint.role);
+    let acp_bar = format!(
+        "        pane size=1 borderless=true {{\n            plugin location=\"zellij:acp-bar\" {{\n                room_id {shared_id}\n                self_provider {self_provider}\n                self_role {self_role}\n                driver_count {}\n                reviewer_count {}\n                human_count {}\n            }}\n        }}",
+        role_counts.driver_count, role_counts.reviewer_count, role_counts.human_count
+    );
     match provider_command {
         Some(provider_command) => {
-            let command =
-                serde_json::to_string(provider_command).unwrap_or_else(|_| "\"sh\"".to_owned());
+            let command = kdl_string(provider_command);
             format!(
-                "layout {{\n    tab name={} {{\n        pane command={} cwd={}\n    }}\n}}",
-                shared_id, command, cwd
+                "layout {{\n    tab name={shared_id} focus=true {{\n        pane size=1 borderless=true {{\n            plugin location=\"tab-bar\"\n        }}\n        pane command={command} cwd={cwd} focus=true\n        pane size=1 borderless=true {{\n            plugin location=\"status-bar\"\n        }}\n{acp_bar}\n    }}\n}}"
             )
         },
         None => format!(
-            "layout {{\n    tab name={} {{\n        pane cwd={}\n    }}\n}}",
-            shared_id, cwd
+            "layout {{\n    tab name={shared_id} focus=true {{\n        pane size=1 borderless=true {{\n            plugin location=\"tab-bar\"\n        }}\n        pane cwd={cwd} focus=true\n        pane size=1 borderless=true {{\n            plugin location=\"status-bar\"\n        }}\n{acp_bar}\n    }}\n}}"
         ),
     }
 }
@@ -350,6 +414,9 @@ pub(crate) fn start_shared_room(
     );
     std::env::set_var("ZELLIJ_AGENT_PROVIDER", &participant.endpoint.provider);
     std::env::set_var("ZELLIJ_AGENT_ROLE", &participant.endpoint.role);
+    let room_role_counts = list_room_endpoints(&shared_id)
+        .map(|endpoints| count_room_roles(&endpoints))
+        .unwrap_or_default();
 
     println!(
         "Shared room: {} ({})",
@@ -393,20 +460,27 @@ pub(crate) fn start_shared_room(
         );
     }
 
-    if let Some(provider_command) = provider_command_for_persona(persona) {
-        if participant.room_created {
-            opts.command = None;
-            opts.session = Some(shared_id.clone());
-            opts.layout = None;
-            opts.new_session_with_layout = None;
-            opts.layout_string = Some(room_layout_string(
-                &shared_id,
-                Some(provider_command),
-                &current_dir,
-            ));
-            start_client(opts);
-            return;
-        } else if let Err(e) = spawn_provider_pane(
+    let provider_command = provider_command_for_persona(persona);
+    let session_active = room_session_is_active(&shared_id);
+
+    if participant.room_created || !session_active {
+        opts.command = None;
+        opts.session = Some(shared_id.clone());
+        opts.layout = None;
+        opts.new_session_with_layout = None;
+        opts.layout_string = Some(room_layout_string(
+            &shared_id,
+            provider_command,
+            &current_dir,
+            &participant.endpoint,
+            room_role_counts,
+        ));
+        start_client(opts);
+        return;
+    }
+
+    if let Some(provider_command) = provider_command {
+        if let Err(e) = spawn_provider_pane(
             &shared_id,
             provider_command,
             current_dir.clone(),
@@ -419,17 +493,24 @@ pub(crate) fn start_shared_room(
         }
     }
 
+    if let Err(e) = send_acp_room_state_to_session(&shared_id, &shared_id) {
+        let _ = append_stream_event(
+            ViewStreamKind::Events,
+            &shared_id,
+            "acp_bar_update_failed",
+            Some(&participant.endpoint),
+            format!("Failed to update ACP bar in '{}'", shared_id),
+            json!({
+                "error": e,
+            }),
+        );
+    }
+
     opts.session = None;
     opts.layout = None;
     opts.new_session_with_layout = None;
-    if participant.room_created {
-        opts.session = Some(shared_id.clone());
-        opts.layout_string = Some(room_layout_string(&shared_id, None, &current_dir));
-        opts.command = None;
-    } else {
-        opts.layout_string = None;
-        opts.command = Some(attach_create_command(shared_id));
-    }
+    opts.layout_string = None;
+    opts.command = Some(attach_create_command(shared_id));
     start_client(opts);
 }
 

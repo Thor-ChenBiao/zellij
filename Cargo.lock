@@ -11,6 +11,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "acp-bar"
+version = "0.1.0"
+dependencies = [
+ "ansi_term",
+ "serde",
+ "serde_json",
+ "unicode-width 0.1.10",
+ "zellij-tile",
+]
+
+[[package]]
 name = "addr2line"
 version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

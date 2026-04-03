@@ -21,6 +21,7 @@
 - 不带 `id` 会创建一个新的共享房间 ID，并打印出来
 - 带 `id` 时，如果房间存在就加入；不存在就创建
 - 房间和参与者元数据会持久化到 Zellij 的缓存目录
+- `zellij claude [id]` / `zellij codex [id]` / `zellij gemini [id]` 新建房间时会保留原生 `status-bar`，并在其下新增一条 `acp-bar`
 - `reviewer` 会记录一份启动 bootstrap prompt 和固定的 review message template
 - `view events` 和 `view code` 会跟随房间自己的流文件
 - `zellij-server` 已经开始把真实 pane 活动写进房间流
@@ -35,6 +36,25 @@
 bridge 已经开始镜像 pane 的实时输入、PTY 输出和 pane viewport 变化。
 review request / feedback 的文件化闭环已经落地，driver pane 的自动回注也已经有第一版启发式实现。
 下一阶段的重点会转向自动触发、更稳的 endpoint-pipe 绑定和人工批准闭环。
+
+### 当前可见性补充
+
+除了 tab 名直接显示 room id，当前房间布局还会额外保留一条常驻的 `acp-bar`：
+
+- 位置在原生快捷键 `status-bar` 的下方
+- 第一版只显示一行
+- 当前内容包括：
+  - `room id`
+  - 当前 endpoint 的 `provider/role`
+  - 已加入房间的角色计数，例如 `D1 R1 H0`
+
+示例：
+
+```text
+ACP hopeful-apricot | claude/driver | D1 R1
+```
+
+这条 bar 不承担事件流或 review 内容展示，只负责让用户一眼看到自己当前正在操作哪个协作房间。
 
 进度记录：
 

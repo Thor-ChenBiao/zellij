@@ -59,6 +59,7 @@ impl PluginConfig {
                 let tag = tag.to_string();
                 if tag == "status-bar"
                     || tag == "tab-bar"
+                    || tag == "acp-bar"
                     || tag == "compact-bar"
                     || tag == "strider"
                     || tag == "session-manager"
