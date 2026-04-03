@@ -3,6 +3,9 @@ use ansi_term::{
     Color::{Fixed, RGB},
     Style,
 };
+use directories::ProjectDirs;
+use serde::Deserialize;
+use std::fs;
 use zellij_tile::prelude::actions::Action;
 use zellij_tile::prelude::*;
 use zellij_tile_utils::palette_match;
@@ -51,6 +54,75 @@ fn locked_interface_indication(palette: Styling) -> LinePart {
         part: locked_styled_text.to_string(),
         len: locked_text_len,
     }
+}
+
+#[derive(Deserialize)]
+struct AgentControlRoomMetadata {
+    shared_id: String,
+}
+
+fn agent_control_plane_hint(help: &ModeInfo, max_width: usize) -> Option<LinePart> {
+    let session_name = help.session_name.as_deref()?;
+    let project_dirs = ProjectDirs::from("org", "Zellij Contributors", "Zellij")?;
+    let cache_dir = project_dirs.cache_dir();
+    let room_dir = cache_dir.join("agent-control-plane").join(session_name);
+    let raw_metadata = fs::read_to_string(room_dir.join("room.json")).ok()?;
+    let room_metadata: AgentControlRoomMetadata = serde_json::from_str(&raw_metadata).ok()?;
+    if room_metadata.shared_id != session_name {
+        return None;
+    }
+
+    let endpoint_count = room_dir
+        .join("endpoints")
+        .read_dir()
+        .ok()
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("json"))
+                .count()
+        })
+        .unwrap_or(0);
+    let text_color = palette_match!(help.style.colors.text_unselected.base);
+    let full_hint = format!(
+        " ACP room: {} | endpoints: {} | add reviewer: zellij reviewer {}",
+        session_name, endpoint_count, session_name
+    );
+    let medium_hint = format!(
+        " ACP room: {} | reviewer: zellij reviewer {}",
+        session_name, session_name
+    );
+    let short_hint = format!(" ACP {} | rv {}", session_name, session_name);
+    let fallback_hint = format!(" ACP {}", session_name);
+    let hint = [full_hint, medium_hint, short_hint, fallback_hint]
+        .into_iter()
+        .find(|candidate| candidate.chars().count() <= max_width)
+        .unwrap_or_else(|| format!(" ACP {}", truncate_middle(session_name, max_width.saturating_sub(5))));
+    Some(LinePart {
+        len: hint.chars().count(),
+        part: Style::new().fg(text_color).bold().paint(hint).to_string(),
+    })
+}
+
+fn truncate_middle(text: &str, max_len: usize) -> String {
+    if text.chars().count() <= max_len {
+        return text.to_owned();
+    }
+    if max_len <= 3 {
+        return "...".chars().take(max_len).collect();
+    }
+    let left_len = (max_len - 3) / 2;
+    let right_len = max_len - 3 - left_len;
+    let left: String = text.chars().take(left_len).collect();
+    let right: String = text
+        .chars()
+        .rev()
+        .take(right_len)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!("{}...{}", left, right)
 }
 
 fn add_shortcut(
@@ -352,6 +424,9 @@ fn best_effort_shortcut_list(help: &ModeInfo, tip: TipFn, max_len: usize) -> Lin
 }
 
 pub fn keybinds(help: &ModeInfo, tip_name: &str, max_width: usize) -> LinePart {
+    if let Some(agent_control_hint) = agent_control_plane_hint(help, max_width) {
+        return agent_control_hint;
+    }
     // It is assumed that there is at least one TIP data in the TIPS HasMap.
     let tip_body = TIPS
         .get(tip_name)

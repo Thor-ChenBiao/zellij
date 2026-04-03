@@ -3332,6 +3332,7 @@ version = "0.1.0"
 dependencies = [
  "ansi_term",
  "colored",
+ "directories",
  "lazy_static",
  "rand 0.8.5",
  "regex",

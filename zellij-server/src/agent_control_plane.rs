@@ -74,8 +74,8 @@ impl RoomTelemetry {
             }
         }
         if buffer.len() > 4096 {
-            let drain_until = buffer.len().saturating_sub(1024);
-            buffer.drain(..drain_until);
+            let keep_from = suffix_start_for_max_bytes(buffer, 1024);
+            buffer.drain(..keep_from);
         }
         emissions
     }
@@ -131,6 +131,17 @@ fn summarize_value(value: &str) -> String {
         let shortened: String = value.chars().take(117).collect();
         format!("{}...", shortened)
     }
+}
+
+fn suffix_start_for_max_bytes(text: &str, max_bytes: usize) -> usize {
+    if text.len() <= max_bytes {
+        return 0;
+    }
+    let mut start = text.len().saturating_sub(max_bytes);
+    while start < text.len() && !text.is_char_boundary(start) {
+        start += 1;
+    }
+    start
 }
 
 pub(crate) fn sanitize_terminal_output(raw_bytes: &[u8]) -> String {
@@ -254,5 +265,18 @@ mod tests {
 
         assert_eq!(first.len(), 1);
         assert!(second.is_empty());
+    }
+
+    #[test]
+    fn trims_long_multibyte_partial_lines_without_panicking() {
+        let mut telemetry = RoomTelemetry::default();
+        let input = "你".repeat(2000);
+
+        let emissions = telemetry.ingest_pty_bytes(9, input.as_bytes());
+        let buffer = telemetry.pty_line_buffers.get(&9).unwrap();
+
+        assert!(emissions.is_empty());
+        assert!(buffer.len() <= 1024);
+        assert!(buffer.chars().all(|ch| ch == '你'));
     }
 }
