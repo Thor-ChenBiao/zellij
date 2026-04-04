@@ -16,25 +16,93 @@ use zellij_utils::{
     shared::web_server_base_url_from_config,
 };
 
+fn try_multicall() -> bool {
+    let exe = std::env::current_exe().ok();
+    let name = exe
+        .as_ref()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    let passthrough_args: Vec<String> = std::env::args().skip(1).collect();
+    // Only treat direct persona aliases as room launch shortcuts when the argv
+    // shape is "alias [room_id]". Internal invocations pass flags (eg: --server),
+    // which must go through normal CLI parsing.
+    let launch_arg = match passthrough_args.as_slice() {
+        [] => None,
+        [single] if !single.starts_with('-') => Some(single.clone()),
+        _ => return false,
+    };
+    let persona = match name {
+        "claude" => Some(AgentPersona::Claude),
+        "codex" => Some(AgentPersona::Codex),
+        "gemini" => Some(AgentPersona::Gemini),
+        "reviewer" => Some(AgentPersona::Reviewer),
+        _ => None,
+    };
+    if let Some(persona) = persona {
+        let shared_id = launch_arg;
+        let opts = CliArgs::default();
+        commands::start_shared_room(opts, persona, shared_id, None, None, None, None);
+        std::process::exit(0);
+    }
+    false
+}
+
 fn main() {
     configure_logger();
     create_config_and_cache_folders();
+
+    // multicall: when invoked as "reviewer", "claude", "codex", or "gemini" directly
+    try_multicall();
+
     let opts = CliArgs::parse();
 
     if let Some(Command::Claude(room_cli)) = opts.command.clone() {
-        commands::start_shared_room(opts, AgentPersona::Claude, room_cli.shared_id);
+        commands::start_shared_room(
+            opts,
+            AgentPersona::Claude,
+            room_cli.shared_id,
+            room_cli.reviewer_count,
+            room_cli.reviewer_prompt,
+            room_cli.reviewer_prompt_file,
+            room_cli.provider_args,
+        );
         std::process::exit(0);
     }
     if let Some(Command::Codex(room_cli)) = opts.command.clone() {
-        commands::start_shared_room(opts, AgentPersona::Codex, room_cli.shared_id);
+        commands::start_shared_room(
+            opts,
+            AgentPersona::Codex,
+            room_cli.shared_id,
+            room_cli.reviewer_count,
+            room_cli.reviewer_prompt,
+            room_cli.reviewer_prompt_file,
+            room_cli.provider_args,
+        );
         std::process::exit(0);
     }
     if let Some(Command::Gemini(room_cli)) = opts.command.clone() {
-        commands::start_shared_room(opts, AgentPersona::Gemini, room_cli.shared_id);
+        commands::start_shared_room(
+            opts,
+            AgentPersona::Gemini,
+            room_cli.shared_id,
+            room_cli.reviewer_count,
+            room_cli.reviewer_prompt,
+            room_cli.reviewer_prompt_file,
+            room_cli.provider_args,
+        );
         std::process::exit(0);
     }
     if let Some(Command::Reviewer(room_cli)) = opts.command.clone() {
-        commands::start_shared_room(opts, AgentPersona::Reviewer, room_cli.shared_id);
+        commands::start_shared_room(
+            opts,
+            AgentPersona::Reviewer,
+            room_cli.shared_id,
+            room_cli.reviewer_count,
+            room_cli.reviewer_prompt,
+            room_cli.reviewer_prompt_file,
+            room_cli.provider_args,
+        );
         std::process::exit(0);
     }
     if let Some(Command::View(view_cli)) = opts.command.clone() {
@@ -59,6 +127,24 @@ fn main() {
                     feedback_cli.file,
                     feedback_cli.source_endpoint,
                 )
+            },
+            zellij_utils::cli::ReviewCli::AutoStart(room_cli) => {
+                commands::start_room_review_automation(room_cli.shared_id)
+            },
+            zellij_utils::cli::ReviewCli::AutoStop(room_cli) => {
+                commands::stop_room_review_automation(room_cli.shared_id)
+            },
+            zellij_utils::cli::ReviewCli::AutoSendOn(room_cli) => {
+                commands::set_room_review_auto_send(room_cli.shared_id, true)
+            },
+            zellij_utils::cli::ReviewCli::AutoSendOff(room_cli) => {
+                commands::set_room_review_auto_send(room_cli.shared_id, false)
+            },
+            zellij_utils::cli::ReviewCli::AutoStatus(room_cli) => {
+                commands::print_room_review_automation_status(room_cli.shared_id)
+            },
+            zellij_utils::cli::ReviewCli::AutoWorker(room_cli) => {
+                commands::run_room_review_automation_worker(room_cli.shared_id)
             },
         }
         std::process::exit(0);

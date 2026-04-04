@@ -17,6 +17,8 @@ struct State {
     driver_count: usize,
     reviewer_count: usize,
     human_count: usize,
+    auto_review_enabled: bool,
+    auto_send_enabled: bool,
     mode_info: ModeInfo,
 }
 
@@ -28,6 +30,8 @@ struct RoomStatePayload {
     driver_count: Option<usize>,
     reviewer_count: Option<usize>,
     human_count: Option<usize>,
+    auto_review_enabled: Option<bool>,
+    auto_send_enabled: Option<bool>,
 }
 
 register_plugin!(State);
@@ -46,7 +50,9 @@ impl ZellijPlugin for State {
         self.driver_count = parse_count(&configuration, "driver_count");
         self.reviewer_count = parse_count(&configuration, "reviewer_count");
         self.human_count = parse_count(&configuration, "human_count");
-        set_selectable(false);
+        self.auto_review_enabled = parse_bool(&configuration, "auto_review_enabled");
+        self.auto_send_enabled = parse_bool(&configuration, "auto_send_enabled");
+        set_selectable(true);
         subscribe(&[EventType::ModeUpdate]);
         rename_plugin_pane(get_plugin_ids().plugin_id, "ACP");
     }
@@ -92,6 +98,12 @@ impl ZellijPlugin for State {
         }
         if let Some(human_count) = payload.human_count {
             self.human_count = human_count;
+        }
+        if let Some(auto_review_enabled) = payload.auto_review_enabled {
+            self.auto_review_enabled = auto_review_enabled;
+        }
+        if let Some(auto_send_enabled) = payload.auto_send_enabled {
+            self.auto_send_enabled = auto_send_enabled;
         }
         true
     }
@@ -158,20 +170,22 @@ impl State {
             return String::new();
         }
         let full = format!(
-            "room: {}{} | roles: {}",
+            "room: {}{} | roles: {} | auto: {}",
             self.room_id,
             self.render_self_section(false),
-            self.role_summary(false)
+            self.role_summary(false),
+            self.automation_summary(false)
         );
         if display_width(&full) <= available_cols {
             return full;
         }
 
         let compact = format!(
-            "{}{} | {}",
+            "{}{} | {} | {}",
             self.room_id,
             self.render_self_section(true),
-            self.role_summary(true)
+            self.role_summary(true),
+            self.automation_summary(true)
         );
         if display_width(&compact) <= available_cols {
             return compact;
@@ -211,6 +225,30 @@ impl State {
         }
         roles.join(" ")
     }
+
+    fn automation_summary(&self, compact: bool) -> String {
+        if compact {
+            format!(
+                "AR:{} AS:{}",
+                if self.auto_review_enabled {
+                    "on"
+                } else {
+                    "off"
+                },
+                if self.auto_send_enabled { "on" } else { "off" }
+            )
+        } else {
+            format!(
+                "review:{} send:{}",
+                if self.auto_review_enabled {
+                    "on"
+                } else {
+                    "off"
+                },
+                if self.auto_send_enabled { "on" } else { "off" }
+            )
+        }
+    }
 }
 
 fn parse_count(configuration: &BTreeMap<String, String>, key: &str) -> usize {
@@ -218,6 +256,13 @@ fn parse_count(configuration: &BTreeMap<String, String>, key: &str) -> usize {
         .get(key)
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(0)
+}
+
+fn parse_bool(configuration: &BTreeMap<String, String>, key: &str) -> bool {
+    configuration
+        .get(key)
+        .map(|value| value == "true" || value == "1")
+        .unwrap_or(false)
 }
 
 fn display_width(text: &str) -> usize {
@@ -271,13 +316,16 @@ mod tests {
             driver_count: 1,
             reviewer_count: 2,
             human_count: 0,
+            auto_review_enabled: true,
+            auto_send_enabled: false,
             mode_info: ModeInfo::default(),
         };
 
-        let rendered = state.render_body(32);
+        let rendered = state.render_body(48);
 
         assert!(rendered.contains("123456"));
         assert!(rendered.contains("claude/driver"));
         assert!(rendered.contains("D1 R2"));
+        assert!(rendered.contains("AR:on AS:off"));
     }
 }

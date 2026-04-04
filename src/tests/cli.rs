@@ -187,6 +187,81 @@ fn review_request_command_with_id_works() {
 }
 
 #[test]
+fn review_auto_start_command_with_id_works() {
+    let args = CliArgs::try_parse_from(["zellij", "review", "auto-start", "team-42"]);
+    assert!(args.is_ok());
+    if let Ok(CliArgs {
+        command: Some(Command::Review(ReviewCli::AutoStart(room))),
+        ..
+    }) = args
+    {
+        assert_eq!(room.shared_id.as_deref(), Some("team-42"));
+    } else {
+        panic!("Expected review auto-start command");
+    }
+}
+
+#[test]
+fn review_auto_stop_command_with_id_works() {
+    let args = CliArgs::try_parse_from(["zellij", "review", "auto-stop", "team-42"]);
+    assert!(args.is_ok());
+    if let Ok(CliArgs {
+        command: Some(Command::Review(ReviewCli::AutoStop(room))),
+        ..
+    }) = args
+    {
+        assert_eq!(room.shared_id.as_deref(), Some("team-42"));
+    } else {
+        panic!("Expected review auto-stop command");
+    }
+}
+
+#[test]
+fn review_auto_send_on_command_with_id_works() {
+    let args = CliArgs::try_parse_from(["zellij", "review", "auto-send-on", "team-42"]);
+    assert!(args.is_ok());
+    if let Ok(CliArgs {
+        command: Some(Command::Review(ReviewCli::AutoSendOn(room))),
+        ..
+    }) = args
+    {
+        assert_eq!(room.shared_id.as_deref(), Some("team-42"));
+    } else {
+        panic!("Expected review auto-send-on command");
+    }
+}
+
+#[test]
+fn review_auto_send_off_command_with_id_works() {
+    let args = CliArgs::try_parse_from(["zellij", "review", "auto-send-off", "team-42"]);
+    assert!(args.is_ok());
+    if let Ok(CliArgs {
+        command: Some(Command::Review(ReviewCli::AutoSendOff(room))),
+        ..
+    }) = args
+    {
+        assert_eq!(room.shared_id.as_deref(), Some("team-42"));
+    } else {
+        panic!("Expected review auto-send-off command");
+    }
+}
+
+#[test]
+fn review_auto_status_command_with_id_works() {
+    let args = CliArgs::try_parse_from(["zellij", "review", "auto-status", "team-42"]);
+    assert!(args.is_ok());
+    if let Ok(CliArgs {
+        command: Some(Command::Review(ReviewCli::AutoStatus(room))),
+        ..
+    }) = args
+    {
+        assert_eq!(room.shared_id.as_deref(), Some("team-42"));
+    } else {
+        panic!("Expected review auto-status command");
+    }
+}
+
+#[test]
 fn review_feedback_command_with_file_and_source_endpoint_works() {
     let args = CliArgs::try_parse_from([
         "zellij",

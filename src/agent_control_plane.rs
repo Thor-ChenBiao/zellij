@@ -14,6 +14,10 @@ const ROOM_SCHEMA_VERSION: u32 = 1;
 const REVIEW_SCHEMA_VERSION: u32 = 1;
 const REVIEW_TARGET_ROLE: &str = "driver";
 
+fn default_reviewer_target_count() -> usize {
+    1
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AgentPersona {
     Claude,
@@ -74,6 +78,12 @@ pub(crate) struct RoomMetadata {
     pub zellij_version: String,
     pub bridge_transport: String,
     pub network_transport: String,
+    #[serde(default = "default_reviewer_target_count")]
+    pub reviewer_target_count: usize,
+    #[serde(default)]
+    pub reviewer_prompt_override: Option<String>,
+    #[serde(default)]
+    pub driver_provider_args: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -227,11 +237,23 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> io::Result<()> {
     Ok(())
 }
 
-fn reviewer_bootstrap_prompt(shared_id: &str, session_name: &str) -> String {
-    format!(
-        "You are the reviewer for shared room '{shared_id}' (session '{session_name}'). \
-Review the driver's latest output, focus on correctness and risk, and send back concise, actionable feedback.",
-    )
+fn reviewer_bootstrap_prompt(
+    shared_id: &str,
+    session_name: &str,
+    reviewer_prompt_override: Option<&str>,
+) -> String {
+    let mut prompt = format!(
+        "你是共享房间 '{shared_id}'（session '{session_name}'）的 reviewer。\
+请评审 driver 的最新输出，关注功能正确性与风险，并给出可执行、可收敛的反馈。"
+    );
+    if let Some(override_prompt) = reviewer_prompt_override {
+        let override_prompt = override_prompt.trim();
+        if !override_prompt.is_empty() {
+            prompt.push_str("\n\n项目自定义评审标准:\n");
+            prompt.push_str(override_prompt);
+        }
+    }
+    prompt
 }
 
 fn reviewer_message_template(label: &str) -> String {
@@ -303,6 +325,9 @@ fn ensure_room_files(root: &Path, shared_id: &str, session_name: &str) -> io::Re
     if metadata_path.exists() {
         let raw = fs::read_to_string(&metadata_path)?;
         let mut metadata: RoomMetadata = serde_json::from_str(&raw).map_err(json_to_io_error)?;
+        if metadata.reviewer_target_count == 0 {
+            metadata.reviewer_target_count = default_reviewer_target_count();
+        }
         metadata.updated_at = now_string();
         write_json(&metadata_path, &metadata)?;
         return Ok(false);
@@ -318,6 +343,9 @@ fn ensure_room_files(root: &Path, shared_id: &str, session_name: &str) -> io::Re
         zellij_version: VERSION.to_owned(),
         bridge_transport: "local-room-cache".to_owned(),
         network_transport: "websocket-planned".to_owned(),
+        reviewer_target_count: default_reviewer_target_count(),
+        reviewer_prompt_override: None,
+        driver_provider_args: None,
     };
     write_json(&metadata_path, &metadata)?;
     fs::write(root.join(shared_id).join("events.log"), "")?;
@@ -335,6 +363,7 @@ fn register_participant_at(
 ) -> io::Result<RegisteredRoomParticipant> {
     let session_name = shared_id.to_owned();
     let room_created = ensure_room_files(root, shared_id, &session_name)?;
+    let room_metadata = room_metadata_at(root, shared_id)?;
     let endpoint_id = format!(
         "{}-{}",
         persona.provider_name(),
@@ -354,7 +383,13 @@ fn register_participant_at(
         bound_pane_id: None,
         bound_pane_id_updated_at: None,
         reviewer_bootstrap_prompt: (persona == AgentPersona::Reviewer)
-            .then(|| reviewer_bootstrap_prompt(shared_id, &session_name)),
+            .then(|| {
+                reviewer_bootstrap_prompt(
+                    shared_id,
+                    &session_name,
+                    room_metadata.reviewer_prompt_override.as_deref(),
+                )
+            }),
         review_message_template: (persona == AgentPersona::Reviewer)
             .then(|| reviewer_message_template(&label)),
     };
@@ -816,21 +851,27 @@ enum FeedbackSection {
 }
 
 fn extract_review_feedback_block(raw: &str) -> io::Result<String> {
-    let start_marker = "[ACP_REVIEW_RESPONSE_V1]";
-    let end_marker = "[/ACP_REVIEW_RESPONSE_V1]";
-    let start = raw.find(start_marker).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "Missing ACP review response start marker",
-        )
-    })?;
-    let end = raw.find(end_marker).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "Missing ACP review response end marker",
-        )
-    })?;
-    Ok(raw[start + start_marker.len()..end].trim().to_owned())
+    let marker_pairs = [
+        ("[ACP_REVIEW_RESPONSE_V1]", "[/ACP_REVIEW_RESPONSE_V1]"),
+        (
+            "[ACP_REVIEW_RESPONSE_V1_BEGIN]",
+            "[ACP_REVIEW_RESPONSE_V1_END]",
+        ),
+    ];
+    for (start_marker, end_marker) in marker_pairs {
+        if let Some(start) = raw.find(start_marker) {
+            if let Some(end) = raw[start + start_marker.len()..]
+                .find(end_marker)
+                .map(|offset| start + start_marker.len() + offset)
+            {
+                return Ok(raw[start + start_marker.len()..end].trim().to_owned());
+            }
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "Missing ACP review response start/end marker",
+    ))
 }
 
 fn parse_key_value(line: &str) -> Option<(&str, &str)> {
@@ -1243,8 +1284,56 @@ pub(crate) fn update_endpoint_pane_binding(
     update_endpoint_pane_binding_at(&room_id_root(), shared_id, endpoint_id, pane_id)
 }
 
+#[allow(dead_code)]
 pub(crate) fn ensure_room(shared_id: &str) -> io::Result<bool> {
     ensure_room_files(&room_id_root(), shared_id, shared_id)
+}
+
+pub(crate) fn room_exists(shared_id: &str) -> bool {
+    room_metadata_path(shared_id).exists()
+}
+
+pub(crate) fn set_room_reviewer_target_count(
+    shared_id: &str,
+    reviewer_target_count: usize,
+) -> io::Result<()> {
+    ensure_room_files(&room_id_root(), shared_id, shared_id)?;
+    let metadata_path = room_metadata_path(shared_id);
+    let raw = fs::read_to_string(&metadata_path)?;
+    let mut metadata: RoomMetadata = serde_json::from_str(&raw).map_err(json_to_io_error)?;
+    metadata.reviewer_target_count = reviewer_target_count.max(1);
+    metadata.updated_at = now_string();
+    write_json(&metadata_path, &metadata)
+}
+
+pub(crate) fn set_room_reviewer_prompt_override(
+    shared_id: &str,
+    reviewer_prompt_override: Option<String>,
+) -> io::Result<()> {
+    ensure_room_files(&room_id_root(), shared_id, shared_id)?;
+    let metadata_path = room_metadata_path(shared_id);
+    let raw = fs::read_to_string(&metadata_path)?;
+    let mut metadata: RoomMetadata = serde_json::from_str(&raw).map_err(json_to_io_error)?;
+    metadata.reviewer_prompt_override = reviewer_prompt_override
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    metadata.updated_at = now_string();
+    write_json(&metadata_path, &metadata)
+}
+
+pub(crate) fn set_room_driver_provider_args(
+    shared_id: &str,
+    driver_provider_args: Option<String>,
+) -> io::Result<()> {
+    ensure_room_files(&room_id_root(), shared_id, shared_id)?;
+    let metadata_path = room_metadata_path(shared_id);
+    let raw = fs::read_to_string(&metadata_path)?;
+    let mut metadata: RoomMetadata = serde_json::from_str(&raw).map_err(json_to_io_error)?;
+    metadata.driver_provider_args = driver_provider_args
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    metadata.updated_at = now_string();
+    write_json(&metadata_path, &metadata)
 }
 
 fn endpoint_metadata_path_in_root(root: &Path, shared_id: &str, endpoint_id: &str) -> PathBuf {
@@ -1254,7 +1343,12 @@ fn endpoint_metadata_path_in_root(root: &Path, shared_id: &str, endpoint_id: &st
 }
 
 pub(crate) fn follow_stream(shared_id: &str, stream: ViewStreamKind) -> io::Result<()> {
-    ensure_room(shared_id)?;
+    if !room_exists(shared_id) {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("Room '{}' does not exist", shared_id),
+        ));
+    }
     let (text_path, _) = stream_paths(shared_id, stream);
     let mut offset = 0usize;
     loop {
@@ -1292,6 +1386,263 @@ pub(crate) fn record_review_feedback(
     )
 }
 
+/// Ensure the ACP hook script exists in the cache directory and is registered
+/// in the provider's settings. Safe to call multiple times (idempotent).
+pub(crate) fn ensure_provider_hooks(persona: AgentPersona) {
+    let hook_script = ensure_hook_script();
+    let hook_script_str = hook_script.display().to_string();
+    match persona {
+        AgentPersona::Claude => {
+            if let Err(e) = ensure_claude_code_hook(&hook_script_str) {
+                eprintln!("Warning: could not auto-configure Claude Code hook: {}", e);
+            }
+        },
+        AgentPersona::Codex => {
+            if let Err(e) = ensure_codex_hook(&hook_script_str) {
+                eprintln!("Warning: could not auto-configure Codex hook: {}", e);
+            }
+        },
+        AgentPersona::Gemini => {
+            if let Err(e) = ensure_gemini_hook(&hook_script_str) {
+                eprintln!("Warning: could not auto-configure Gemini hook: {}", e);
+            }
+        },
+        AgentPersona::Reviewer => {},
+    }
+}
+
+fn home_dir() -> io::Result<PathBuf> {
+    std::env::var("HOME")
+        .map(PathBuf::from)
+        .map_err(|_| io::Error::new(io::ErrorKind::NotFound, "HOME not set"))
+}
+
+fn ensure_hook_script() -> PathBuf {
+    let script_path = room_id_root().join("acp-hook.sh");
+    let _ = fs::create_dir_all(room_id_root());
+    let script = r##"#!/bin/bash
+# ACP Hook — writes structured tool call events to the ACP room streams.
+# Auto-generated by zellij. Safe outside Zellij (silently exits).
+
+ROOM_ID="${ZELLIJ_AGENT_SHARED_ID:-}"
+[ -z "$ROOM_ID" ] && exit 0
+
+if [ "$(uname)" = "Darwin" ]; then
+    ACP_ROOT="$HOME/Library/Caches/org.Zellij-Contributors.Zellij/agent-control-plane"
+else
+    ACP_ROOT="${XDG_CACHE_HOME:-$HOME/.cache}/zellij/agent-control-plane"
+fi
+ROOM_DIR="$ACP_ROOT/$ROOM_ID"
+[ ! -d "$ROOM_DIR" ] && exit 0
+
+HOOK_JSON=$(cat)
+[ -z "$HOOK_JSON" ] && exit 0
+
+PROVIDER="${ZELLIJ_AGENT_PROVIDER:-unknown}"
+ENDPOINT="${ZELLIJ_AGENT_ENDPOINT_ID:-unknown}"
+ROLE="${ZELLIJ_AGENT_ROLE:-driver}"
+NOW=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+# Parse tool name and file path from hook JSON
+eval $(echo "$HOOK_JSON" | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    tool = d.get('tool_name') or d.get('function_name') or d.get('tool',{}).get('name','unknown')
+    inp = d.get('tool_input') or d.get('input') or d.get('args') or {}
+    if isinstance(inp, str):
+        try: inp = json.loads(inp)
+        except: inp = {}
+    fpath = ''
+    if isinstance(inp, dict):
+        fpath = inp.get('file_path') or inp.get('path') or inp.get('filename') or ''
+    print(f'TOOL={json.dumps(tool)}')
+    print(f'FILE_PATH={json.dumps(fpath)}')
+except:
+    print('TOOL=\"unknown\"')
+    print('FILE_PATH=\"\"')
+" 2>/dev/null)
+
+# Write to events stream
+echo "$NOW | $PROVIDER | $ROLE | tool_call | $TOOL" >> "$ROOM_DIR/events.log"
+python3 -c "
+import json, sys
+event = {
+    'time': '$NOW', 'stream': 'events', 'kind': 'tool_call',
+    'shared_id': '$ROOM_ID', 'endpoint_id': '$ENDPOINT',
+    'provider': '$PROVIDER', 'role': '$ROLE',
+    'message': '$TOOL',
+    'payload': {'tool': '$TOOL', 'source': 'provider_hook'}
+}
+print(json.dumps(event))
+" >> "$ROOM_DIR/events.jsonl" 2>/dev/null
+
+# For Edit/Write: also write to code stream with file content
+case "$TOOL" in
+    Edit|Write|MultiEdit|edit|write|multi_edit)
+        if [ -n "$FILE_PATH" ] && [ -f "$FILE_PATH" ]; then
+            LINES=$(wc -l < "$FILE_PATH" | tr -d ' ')
+            echo "" >> "$ROOM_DIR/code.log"
+            echo "━━━ $TOOL: $FILE_PATH ($LINES lines) ━━━ $NOW" >> "$ROOM_DIR/code.log"
+            DISPLAY_PATH="$FILE_PATH"
+            if command -v git >/dev/null 2>&1; then
+                GIT_ROOT=$(git -C "$(dirname "$FILE_PATH")" rev-parse --show-toplevel 2>/dev/null || true)
+                GIT_CHANGED=$(git -C "$(dirname "$FILE_PATH")" --no-pager diff --name-only -- "$FILE_PATH" 2>/dev/null | head -n 1)
+                if [ -n "$GIT_ROOT" ] && [ -n "$GIT_CHANGED" ] && [ -f "$GIT_ROOT/$GIT_CHANGED" ]; then
+                    DISPLAY_PATH="$GIT_ROOT/$GIT_CHANGED"
+                fi
+            fi
+            EXT="${DISPLAY_PATH##*.}"
+            LANG_HINT=""
+            case "$EXT" in
+                py) LANG_HINT="python" ;;
+                js|mjs|cjs) LANG_HINT="javascript" ;;
+                ts|tsx) LANG_HINT="typescript" ;;
+                jsx) LANG_HINT="jsx" ;;
+                java) LANG_HINT="java" ;;
+                c) LANG_HINT="c" ;;
+                cc|cpp|cxx|hpp|hh|hxx) LANG_HINT="cpp" ;;
+                md|markdown) LANG_HINT="markdown" ;;
+                go) LANG_HINT="go" ;;
+                rs) LANG_HINT="rust" ;;
+                json) LANG_HINT="json" ;;
+                yml|yaml) LANG_HINT="yaml" ;;
+                sh|zsh|bash) LANG_HINT="bash" ;;
+            esac
+            if command -v bat >/dev/null 2>&1; then
+                if [ -n "$LANG_HINT" ]; then
+                    bat --color=always --style=plain --paging=never --language "$LANG_HINT" "$DISPLAY_PATH" >> "$ROOM_DIR/code.log" 2>/dev/null || cat "$DISPLAY_PATH" >> "$ROOM_DIR/code.log"
+                else
+                    bat --color=always --style=plain --paging=never "$DISPLAY_PATH" >> "$ROOM_DIR/code.log" 2>/dev/null || cat "$DISPLAY_PATH" >> "$ROOM_DIR/code.log"
+                fi
+            else
+                cat "$DISPLAY_PATH" >> "$ROOM_DIR/code.log"
+            fi
+            python3 -c "
+import json
+event = {
+    'time': '$NOW', 'stream': 'code', 'kind': 'code_change',
+    'shared_id': '$ROOM_ID', 'endpoint_id': '$ENDPOINT',
+    'provider': '$PROVIDER', 'role': '$ROLE',
+    'message': '$TOOL: $FILE_PATH',
+    'payload': {'tool': '$TOOL', 'file_path': '$FILE_PATH', 'source': 'provider_hook'}
+}
+print(json.dumps(event))
+" >> "$ROOM_DIR/code.jsonl" 2>/dev/null
+        fi
+        ;;
+esac
+exit 0
+"##;
+    if fs::read_to_string(&script_path)
+        .map(|existing| existing == script)
+        .unwrap_or(false)
+    {
+        return script_path;
+    }
+    let _ = fs::write(&script_path, script);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755));
+    }
+    script_path
+}
+
+fn ensure_claude_code_hook(hook_script: &str) -> io::Result<()> {
+    let settings_path = home_dir()?
+        .join(".claude")
+        .join("settings.json");
+    upsert_json_hook(&settings_path, "hooks", "PostToolUse", hook_script)
+}
+
+fn ensure_codex_hook(hook_script: &str) -> io::Result<()> {
+    let hooks_path = home_dir()?
+        .join(".codex")
+        .join("hooks.json");
+    upsert_json_hook(&hooks_path, "hooks", "PostToolUse", hook_script)
+}
+
+fn ensure_gemini_hook(hook_script: &str) -> io::Result<()> {
+    let settings_path = home_dir()?
+        .join(".gemini")
+        .join("settings.json");
+    upsert_json_hook(&settings_path, "hooks", "AfterTool", hook_script)
+}
+
+fn upsert_json_hook(
+    settings_path: &Path,
+    hooks_key: &str,
+    event_key: &str,
+    hook_script: &str,
+) -> io::Result<()> {
+    if let Some(parent) = settings_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut root: serde_json::Value = if settings_path.exists() {
+        let raw = fs::read_to_string(settings_path)?;
+        match serde_json::from_str(&raw) {
+            Ok(v) => v,
+            Err(_) => {
+                // Don't overwrite a file we can't parse — bail out safely
+                return Ok(());
+            },
+        }
+    } else {
+        serde_json::json!({})
+    };
+    let hooks = root
+        .as_object_mut()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "settings is not an object"))?
+        .entry(hooks_key)
+        .or_insert_with(|| serde_json::json!({}));
+    let event_hooks = hooks
+        .as_object_mut()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "hooks is not an object"))?
+        .entry(event_key)
+        .or_insert_with(|| serde_json::json!([]));
+    let hooks_array = event_hooks
+        .as_array_mut()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "event hooks is not an array"))?;
+    // Check if already registered
+    let already_registered = hooks_array.iter().any(|entry| {
+        // Check both old format (command at top level) and new format (hooks array)
+        let top_level = entry
+            .get("command")
+            .and_then(|c| c.as_str())
+            .map(|c| c.contains("acp-hook"))
+            .unwrap_or(false);
+        let nested = entry
+            .get("hooks")
+            .and_then(|h| h.as_array())
+            .map(|arr| {
+                arr.iter().any(|h| {
+                    h.get("command")
+                        .and_then(|c| c.as_str())
+                        .map(|c| c.contains("acp-hook"))
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false);
+        top_level || nested
+    });
+    if already_registered {
+        return Ok(());
+    }
+    // Use Claude Code's matcher + hooks format
+    hooks_array.push(serde_json::json!({
+        "matcher": "",
+        "hooks": [{
+            "type": "command",
+            "command": hook_script,
+            "timeout": 5000
+        }]
+    }));
+    let formatted = serde_json::to_string_pretty(&root).map_err(json_to_io_error)?;
+    fs::write(settings_path, formatted)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1316,6 +1667,42 @@ mod tests {
         assert!(participant.endpoint.review_message_template.is_some());
         assert!(temp.path().join(shared_id).join("events.log").exists());
         assert!(temp.path().join(shared_id).join("code.log").exists());
+    }
+
+    #[test]
+    fn room_metadata_includes_workspace_defaults() {
+        let temp = tempdir().unwrap();
+        let shared_id = "workspace-defaults";
+        ensure_room_files(temp.path(), shared_id, shared_id).unwrap();
+        let metadata = room_metadata_at(temp.path(), shared_id).unwrap();
+
+        assert_eq!(metadata.reviewer_target_count, 1);
+        assert!(metadata.reviewer_prompt_override.is_none());
+        assert!(metadata.driver_provider_args.is_none());
+    }
+
+    #[test]
+    fn reviewer_bootstrap_uses_room_prompt_override() {
+        let temp = tempdir().unwrap();
+        let shared_id = "workspace-prompt-override";
+        ensure_room_files(temp.path(), shared_id, shared_id).unwrap();
+        let metadata_path = temp.path().join(shared_id).join("room.json");
+        let raw = fs::read_to_string(&metadata_path).unwrap();
+        let mut metadata: RoomMetadata = serde_json::from_str(&raw).unwrap();
+        metadata.reviewer_prompt_override = Some("请重点检查并发和边界条件。".to_owned());
+        write_json(&metadata_path, &metadata).unwrap();
+
+        let reviewer = register_participant_at(
+            temp.path(),
+            shared_id,
+            AgentPersona::Reviewer,
+            Path::new("/tmp/repo"),
+        )
+        .unwrap();
+
+        let prompt = reviewer.endpoint.reviewer_bootstrap_prompt.unwrap();
+        assert!(prompt.contains("项目自定义评审标准"));
+        assert!(prompt.contains("请重点检查并发和边界条件。"));
     }
 
     #[test]

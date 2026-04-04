@@ -62,6 +62,13 @@ ACP hopeful-apricot | claude/driver | D1 R1
 
 - [2026-04-03 进度](/Users/chenbiao/zellij/docs/agent-control-plane/progress/2026-04-03.md)
 
+测试与设计文档：
+
+- [E2E 测试用例](./E2E_TEST_PLAN.md)
+- [E2E 测试报告 (2026-04-04)](./E2E_TEST_REPORT.md)
+- [`view code` 重新设计：代码变更 diff 流](./view-code-redesign.md)
+- [Event Stream 重新设计：从字符级到 Tool Call 级](./event-stream-redesign.md)
+
 协议文档：
 
 - [Reviewer 自主性与通信协议](/Users/chenbiao/zellij/docs/agent-control-plane/reviewer-protocol.md)

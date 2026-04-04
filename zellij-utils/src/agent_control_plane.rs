@@ -10,6 +10,10 @@ use uuid::Uuid;
 use crate::consts::{VERSION, ZELLIJ_CACHE_DIR};
 
 const ROOM_SCHEMA_VERSION: u32 = 1;
+
+fn default_reviewer_target_count() -> usize {
+    1
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ViewStreamKind {
     Events,
@@ -35,6 +39,12 @@ pub struct RoomMetadata {
     pub zellij_version: String,
     pub bridge_transport: String,
     pub network_transport: String,
+    #[serde(default = "default_reviewer_target_count")]
+    pub reviewer_target_count: usize,
+    #[serde(default)]
+    pub reviewer_prompt_override: Option<String>,
+    #[serde(default)]
+    pub driver_provider_args: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -153,6 +163,9 @@ pub fn ensure_room_files(shared_id: &str, session_name: &str) -> io::Result<bool
     if metadata_path.exists() {
         let raw = fs::read_to_string(&metadata_path)?;
         let mut metadata: RoomMetadata = serde_json::from_str(&raw).map_err(json_to_io_error)?;
+        if metadata.reviewer_target_count == 0 {
+            metadata.reviewer_target_count = default_reviewer_target_count();
+        }
         metadata.updated_at = now_string();
         write_json(&metadata_path, &metadata)?;
         return Ok(false);
@@ -168,6 +181,9 @@ pub fn ensure_room_files(shared_id: &str, session_name: &str) -> io::Result<bool
         zellij_version: VERSION.to_owned(),
         bridge_transport: "local-room-cache".to_owned(),
         network_transport: "websocket-planned".to_owned(),
+        reviewer_target_count: default_reviewer_target_count(),
+        reviewer_prompt_override: None,
+        driver_provider_args: None,
     };
     write_json(&metadata_path, &metadata)?;
     fs::write(room_events_log_path(shared_id), "")?;
@@ -223,6 +239,36 @@ pub fn append_stream_event(
         &serde_json::to_string(&event).map_err(json_to_io_error)?,
     )?;
     Ok(())
+}
+
+pub fn room_exists_check(session_name: &str) -> io::Result<bool> {
+    Ok(room_exists(session_name))
+}
+
+pub fn append_stream_jsonl_only(
+    stream: ViewStreamKind,
+    shared_id: &str,
+    kind: &str,
+    message: String,
+    payload: serde_json::Value,
+) -> io::Result<()> {
+    let (_, jsonl_path) = stream_paths(shared_id, stream);
+    let time = now_string();
+    let event = StreamEvent {
+        time,
+        stream: stream.as_str().to_owned(),
+        kind: kind.to_owned(),
+        shared_id: shared_id.to_owned(),
+        endpoint_id: None,
+        provider: None,
+        role: None,
+        message,
+        payload,
+    };
+    append_line(
+        &jsonl_path,
+        &serde_json::to_string(&event).map_err(json_to_io_error)?,
+    )
 }
 
 pub fn append_session_stream_event(

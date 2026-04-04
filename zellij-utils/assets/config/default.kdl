@@ -232,6 +232,7 @@ plugins {
     status-bar location="zellij:status-bar"
     strider location="zellij:strider"
     compact-bar location="zellij:compact-bar"
+    acp-bar location="zellij:acp-bar"
     session-manager location="zellij:session-manager"
     welcome-screen location="zellij:session-manager" {
         welcome_screen true
@@ -508,6 +509,7 @@ load_plugins {
 // Default: true
 //
 // show_release_notes false
+// show_startup_tips false
 
 // Whether to enable mouse hover effects and pane grouping functionality
 // Default: true

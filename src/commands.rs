@@ -1,18 +1,24 @@
 use crate::agent_control_plane::{
-    append_stream_event, follow_stream, list_room_endpoints, prepare_review_request,
-    record_review_feedback, register_participant, room_metadata, update_endpoint_pane_binding,
-    AgentPersona, EndpointMetadata, ViewStreamKind,
+    append_stream_event, ensure_provider_hooks, follow_stream, list_room_endpoints,
+    prepare_review_request, record_review_feedback, register_participant, room_id_root,
+    room_metadata, set_room_driver_provider_args, set_room_reviewer_prompt_override,
+    set_room_reviewer_target_count, update_endpoint_pane_binding, AgentPersona, EndpointMetadata,
+    PersistedReviewFeedback, PersistedReviewRequest, ViewStreamKind,
 };
 use dialoguer::Confirm;
+use humantime::{format_rfc3339_seconds, parse_rfc3339};
+use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
 use std::{
     collections::HashSet,
     fs::File,
+    io,
     io::prelude::*,
     path::{Path, PathBuf},
     process, thread,
-    time::Duration,
+    time::{Duration, SystemTime},
 };
+use std::{fs, process::Stdio};
 
 #[cfg(feature = "web_server_capability")]
 use isahc::{config::RedirectPolicy, prelude::*, HttpClient, Request};
@@ -254,15 +260,8 @@ fn attach_create_command(session_name: String) -> Command {
 }
 
 fn generate_short_room_id() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    let seed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
-    for offset in 0..10_000u64 {
-        let candidate = 100_000 + ((seed + offset) % 900_000);
-        let candidate = candidate.to_string();
+    for id in 1..10_000u64 {
+        let candidate = id.to_string();
         if room_metadata(&candidate).is_err() && !room_session_is_active(&candidate) {
             return candidate;
         }
@@ -294,6 +293,30 @@ fn terminal_provider_command(provider: &str) -> Option<&'static str> {
         "gemini" => Some("gemini"),
         _ => None,
     }
+}
+
+/// Generate a wrapper script that sets ACP env vars before launching the provider command.
+/// This ensures hooks can detect ZELLIJ_AGENT_SHARED_ID inside the pane.
+fn provider_wrapper_script(
+    shared_id: &str,
+    endpoint_id: &str,
+    provider: &str,
+    role: &str,
+    provider_command: &str,
+) -> String {
+    let wrapper_dir = crate::agent_control_plane::room_id_root().join(shared_id);
+    let _ = std::fs::create_dir_all(&wrapper_dir);
+    let wrapper_path = wrapper_dir.join(format!("{}.sh", endpoint_id));
+    let script = format!(
+        "#!/bin/bash\nexport ZELLIJ_AGENT_SHARED_ID={shared_id}\nexport ZELLIJ_AGENT_ENDPOINT_ID={endpoint_id}\nexport ZELLIJ_AGENT_PROVIDER={provider}\nexport ZELLIJ_AGENT_ROLE={role}\nexec {provider_command} \"$@\"\n"
+    );
+    let _ = std::fs::write(&wrapper_path, &script);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&wrapper_path, std::fs::Permissions::from_mode(0o755));
+    }
+    wrapper_path.display().to_string()
 }
 
 fn latest_driver_endpoint(endpoints: &[EndpointMetadata]) -> Option<&EndpointMetadata> {
@@ -330,11 +353,35 @@ fn provider_context_for_persona(
     }
 }
 
+fn apply_room_driver_provider_args(
+    shared_id: &str,
+    persona: AgentPersona,
+    provider_command: Option<String>,
+) -> Option<String> {
+    if persona == AgentPersona::Reviewer {
+        return provider_command;
+    }
+    let extra_args = room_metadata(shared_id)
+        .ok()
+        .and_then(|metadata| metadata.driver_provider_args)
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    match (provider_command, extra_args) {
+        (Some(provider_command), Some(extra_args)) => Some(format!(
+            "{} {}",
+            provider_command,
+            extra_args
+        )),
+        (provider_command, None) => provider_command,
+        (None, _) => None,
+    }
+}
+
 fn reviewer_bootstrap_message(endpoint: &EndpointMetadata) -> Option<String> {
     let bootstrap_prompt = endpoint.reviewer_bootstrap_prompt.as_deref()?;
     let review_message_template = endpoint.review_message_template.as_deref()?;
     Some(format!(
-        "{bootstrap_prompt}\n\nIdentity:\n- room_id: {room_id}\n- reviewer_endpoint: {endpoint_id}\n- role: reviewer\n- review_target_role: driver\n\nWhen you send structured feedback back to the driver, use this exact protocol:\n[ACP_REVIEW_RESPONSE_V1]\nroom_id: {room_id}\nrequest_id: <request_id>\nsource_endpoint: {endpoint_id}\ntarget_role: driver\nseverity: <low|medium|high>\nconfidence: <low|medium|high>\nshould_send: true\nsummary: <one-line summary>\n\nfindings:\n- <finding>\n\nactions:\n- <action>\n\nnotes:\n- <optional notes>\n[/ACP_REVIEW_RESPONSE_V1]\n\nHuman-readable review template:\n{review_message_template}\n\nReply once with READY as the reviewer, then wait for review requests.",
+        "{bootstrap_prompt}\n\n身份信息:\n- room_id: {room_id}\n- reviewer_endpoint: {endpoint_id}\n- role: reviewer\n- review_target_role: driver\n\n评审目标:\n- 保持客观：基于证据校验 driver 的说法，不确定项要明确标注。\n- 促进收敛：目标是把问题收敛到可交付状态，避免无休止往返。\n\n你回给 driver 时，严格使用以下结构化协议:\n[ACP_REVIEW_RESPONSE_V1]\nroom_id: {room_id}\nrequest_id: <request_id>\nsource_endpoint: {endpoint_id}\ntarget_role: driver\nseverity: <low|medium|high>\nconfidence: <low|medium|high>\nshould_send: true\nloop_control: <CONTINUE|END_REVIEW>\nsummary: <one-line summary>\n\nfindings:\n- <finding>\n\nactions:\n- <action>\n\nnotes:\n- <optional notes>\n[/ACP_REVIEW_RESPONSE_V1]\n\n规则:\n- 把 `request_id: <request_id>` 替换为最新 ACP_REVIEW_REQUEST 中的真实 request_id。\n- 每个 request 只返回一个 ACP_REVIEW_RESPONSE_V1 block。\n- 常规轮次使用 `loop_control: CONTINUE`。\n- 当你判断质量已达标、无需继续迭代时，使用 `loop_control: END_REVIEW`。\n- 如果要给 driver 一条最终总结，就 `should_send: true`；如果想静默收敛，就 `should_send: false`。\n- 返回一轮后等待下一条 request，不要连续输出多轮。\n\n人类可读模板:\n{review_message_template}\n\n首次只回复一次 READY，然后等待 review request。",
         room_id = endpoint.shared_id,
         endpoint_id = endpoint.endpoint_id,
     ))
@@ -345,6 +392,398 @@ struct RoomRoleCounts {
     driver_count: usize,
     reviewer_count: usize,
     human_count: usize,
+}
+
+const REVIEW_AUTOMATION_SCHEMA_VERSION: u32 = 1;
+const REVIEW_AUTOMATION_POLL_MS: u64 = 1200;
+const REVIEW_AUTOMATION_IDLE_SECS: u64 = 4;
+const REVIEW_REQUEST_TIMEOUT_SECS: u64 = 300;
+const REVIEW_RESPONSE_START_MARKER: &str = "[ACP_REVIEW_RESPONSE_V1]";
+const REVIEW_RESPONSE_END_MARKER: &str = "[/ACP_REVIEW_RESPONSE_V1]";
+const REVIEW_LOOP_CONTROL_END: &str = "END_REVIEW";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ReviewAutomationState {
+    schema_version: u32,
+    auto_review_enabled: bool,
+    auto_send_enabled: bool,
+    worker_started_at: Option<String>,
+    last_driver_fingerprint: Option<String>,
+    last_request_id: Option<String>,
+    active_request_id: Option<String>,
+    active_request_started_at: Option<String>,
+    last_response_fingerprint: Option<String>,
+    updated_at: String,
+}
+
+impl Default for ReviewAutomationState {
+    fn default() -> Self {
+        Self {
+            schema_version: REVIEW_AUTOMATION_SCHEMA_VERSION,
+            auto_review_enabled: false,
+            auto_send_enabled: false,
+            worker_started_at: None,
+            last_driver_fingerprint: None,
+            last_request_id: None,
+            active_request_id: None,
+            active_request_started_at: None,
+            last_response_fingerprint: None,
+            updated_at: timestamp_now(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct StreamEventRow {
+    time: String,
+    kind: String,
+    message: String,
+    endpoint_id: Option<String>,
+    payload: serde_json::Value,
+}
+
+#[derive(Debug, Clone)]
+struct DriverTurnState {
+    fingerprint: String,
+    latest_event_at: SystemTime,
+}
+
+fn timestamp_now() -> String {
+    format_rfc3339_seconds(SystemTime::now()).to_string()
+}
+
+fn review_automation_dir(shared_id: &str) -> PathBuf {
+    room_id_root().join(shared_id).join("review")
+}
+
+fn review_automation_state_path(shared_id: &str) -> PathBuf {
+    review_automation_dir(shared_id).join("automation.json")
+}
+
+fn review_automation_worker_lock_path(shared_id: &str) -> PathBuf {
+    review_automation_dir(shared_id).join("auto-worker.lock")
+}
+
+fn load_review_automation_state(shared_id: &str) -> ReviewAutomationState {
+    let state_path = review_automation_state_path(shared_id);
+    let Ok(raw) = fs::read_to_string(state_path) else {
+        return ReviewAutomationState::default();
+    };
+    let mut state: ReviewAutomationState =
+        serde_json::from_str(&raw).unwrap_or_else(|_| ReviewAutomationState::default());
+    if state.schema_version == 0 {
+        state.schema_version = REVIEW_AUTOMATION_SCHEMA_VERSION;
+    }
+    // Backward-compatible migration: old state had only last_request_id.
+    // If no response has been recorded yet, treat last_request_id as in-flight.
+    if state.active_request_id.is_none()
+        && state.last_response_fingerprint.is_none()
+        && state.last_request_id.is_some()
+    {
+        state.active_request_id = state.last_request_id.clone();
+        state.active_request_started_at = Some(state.updated_at.clone());
+    }
+    if state.active_request_id.is_some() && state.active_request_started_at.is_none() {
+        state.active_request_started_at = Some(state.updated_at.clone());
+    }
+    state
+}
+
+fn review_request_timed_out(started_at: &str) -> bool {
+    parse_rfc3339(started_at)
+        .ok()
+        .and_then(|started_at| SystemTime::now().duration_since(started_at).ok())
+        .map(|elapsed| elapsed >= Duration::from_secs(REVIEW_REQUEST_TIMEOUT_SECS))
+        .unwrap_or(false)
+}
+
+fn save_review_automation_state(
+    shared_id: &str,
+    mut state: ReviewAutomationState,
+) -> Result<ReviewAutomationState, String> {
+    state.schema_version = REVIEW_AUTOMATION_SCHEMA_VERSION;
+    state.updated_at = timestamp_now();
+    let path = review_automation_state_path(shared_id);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let raw = serde_json::to_vec_pretty(&state).map_err(|e| e.to_string())?;
+    fs::write(path, raw).map_err(|e| e.to_string())?;
+    Ok(state)
+}
+
+fn stream_jsonl_path(shared_id: &str, stream: ViewStreamKind) -> PathBuf {
+    match stream {
+        ViewStreamKind::Events => room_id_root().join(shared_id).join("events.jsonl"),
+        ViewStreamKind::Code => room_id_root().join(shared_id).join("code.jsonl"),
+    }
+}
+
+fn read_stream_rows(
+    shared_id: &str,
+    stream: ViewStreamKind,
+) -> Result<Vec<StreamEventRow>, String> {
+    let path = stream_jsonl_path(shared_id, stream);
+    if !path.exists() {
+        return Ok(vec![]);
+    }
+    let raw = fs::read_to_string(path).map_err(|e| e.to_string())?;
+    raw.lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str::<StreamEventRow>(line).map_err(|e| e.to_string()))
+        .collect()
+}
+
+fn terminal_id_from_pane_id(pane_id: &str) -> Option<u64> {
+    pane_id
+        .strip_prefix("terminal_")
+        .and_then(|id| id.parse::<u64>().ok())
+}
+
+fn event_matches_pane(
+    event: &StreamEventRow,
+    pane_id: &str,
+    driver_endpoint_id: Option<&str>,
+) -> bool {
+    // Match by pane_id in payload
+    if event
+        .payload
+        .get("pane_id")
+        .and_then(|value| value.as_str())
+        .map(|value| value == pane_id)
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    // Match by terminal_id in payload
+    if let Some(terminal_id) = terminal_id_from_pane_id(pane_id) {
+        if event
+            .payload
+            .get("terminal_id")
+            .and_then(|value| value.as_u64())
+            .map(|value| value == terminal_id)
+            .unwrap_or(false)
+        {
+            return true;
+        }
+    }
+    // Match by endpoint_id in event (provider hooks don't include pane_id/terminal_id).
+    if let Some(driver_endpoint_id) = driver_endpoint_id {
+        if event.endpoint_id.as_deref() == Some(driver_endpoint_id) {
+            return true;
+        }
+    }
+    false
+}
+
+fn driver_relevant_event_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "write_character"
+            | "write_to_pane_id"
+            | "paste"
+            | "tool_call"
+            | "pane_snapshot"
+    )
+}
+
+fn is_internal_acp_injection_event(event: &StreamEventRow) -> bool {
+    event.kind == "paste"
+        && (event.message.contains("[ACP_MESSAGE_BEGIN]")
+            || event.message.contains("[ACP_REVIEW_REQUEST_BEGIN]"))
+}
+
+fn stable_fingerprint(text: &str) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = DefaultHasher::new();
+    text.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+fn event_stable_signature(event: &StreamEventRow) -> String {
+    let payload = serde_json::to_string(&event.payload).unwrap_or_default();
+    format!("{}|{}|{}", event.kind, event.message, payload)
+}
+
+fn driver_turn_state(
+    shared_id: &str,
+    driver_pane_id: &str,
+    driver_endpoint_id: &str,
+) -> Result<Option<DriverTurnState>, String> {
+    let events = read_stream_rows(shared_id, ViewStreamKind::Events)?;
+    let relevant_events: Vec<&StreamEventRow> = events
+        .iter()
+        .filter(|event| event_matches_pane(event, driver_pane_id, Some(driver_endpoint_id)))
+        .filter(|event| driver_relevant_event_kind(&event.kind))
+        .filter(|event| !is_internal_acp_injection_event(event))
+        .collect();
+    if relevant_events.is_empty() {
+        return Ok(None);
+    }
+    let mut last_signature: Option<String> = None;
+    let mut latest = relevant_events
+        .first()
+        .and_then(|event| parse_rfc3339(&event.time).ok())
+        .unwrap_or_else(SystemTime::now);
+    let mut stable_events = Vec::new();
+    for event in &relevant_events {
+        let signature = event_stable_signature(event);
+        if last_signature.as_deref() == Some(signature.as_str()) {
+            continue;
+        }
+        last_signature = Some(signature.clone());
+        latest = parse_rfc3339(&event.time).unwrap_or_else(|_| SystemTime::now());
+        stable_events.push(signature);
+    }
+    let fingerprint_source = stable_events
+        .iter()
+        .rev()
+        .take(24)
+        .rev()
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("\n");
+    Ok(Some(DriverTurnState {
+        fingerprint: stable_fingerprint(&fingerprint_source),
+        latest_event_at: latest,
+    }))
+}
+
+fn extract_latest_response_block_from_text(text: &str) -> Option<String> {
+    const LEGACY_START: &str = "[ACP_REVIEW_RESPONSE_V1_BEGIN]";
+    const LEGACY_END: &str = "[ACP_REVIEW_RESPONSE_V1_END]";
+
+    let marker_pairs = [
+        (REVIEW_RESPONSE_START_MARKER, REVIEW_RESPONSE_END_MARKER),
+        (LEGACY_START, LEGACY_END),
+    ];
+    for (start_marker, end_marker) in marker_pairs {
+        if let Some(end_index) = text.rfind(end_marker) {
+            let prefix = &text[..end_index];
+            if let Some(start_index) = prefix.rfind(start_marker) {
+                let end = end_index + end_marker.len();
+                return Some(text[start_index..end].trim().to_owned());
+            }
+        }
+    }
+    None
+}
+
+fn latest_reviewer_response_block(
+    shared_id: &str,
+    reviewer_pane_ids: &HashSet<String>,
+) -> Result<Option<(String, String, String)>, String> {
+    let events = read_stream_rows(shared_id, ViewStreamKind::Events)?;
+    for event in events.iter().rev() {
+        if event.kind != "pane_snapshot" {
+            continue;
+        }
+        let pane_id = event
+            .payload
+            .get("pane_id")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        if !reviewer_pane_ids.contains(pane_id) {
+            continue;
+        }
+        let lines = event
+            .payload
+            .get("snapshot")
+            .or_else(|| event.payload.get("viewport"))
+            .and_then(|value| value.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let snapshot = lines
+            .iter()
+            .filter_map(|line| line.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if let Some(block) = extract_latest_response_block_from_text(&snapshot) {
+            return Ok(Some((block, pane_id.to_owned(), event.time.clone())));
+        }
+    }
+    Ok(None)
+}
+
+fn snapshot_is_fresh_for_request(snapshot_time: &str, request_started_at: Option<&str>) -> bool {
+    let Some(request_started_at) = request_started_at else {
+        return true;
+    };
+    let Ok(snapshot_time) = parse_rfc3339(snapshot_time) else {
+        return true;
+    };
+    let Ok(request_started_at) = parse_rfc3339(request_started_at) else {
+        return true;
+    };
+    snapshot_time >= request_started_at
+}
+
+fn parse_review_response_request_id(raw_block: &str) -> Option<String> {
+    extract_latest_response_block_from_text(raw_block).and_then(|block| {
+        block.lines().find_map(|line| {
+            line.trim()
+                .strip_prefix("request_id:")
+                .map(|value| value.trim().to_owned())
+        })
+    })
+}
+
+fn is_placeholder_request_id(request_id: &str) -> bool {
+    matches!(request_id.trim(), "<request_id>" | "{request_id}" | "request_id")
+}
+
+fn reviewer_response_is_unfilled_template(raw_block: &str) -> bool {
+    let markers = [
+        "request_id: <request_id>",
+        "severity: <low|medium|high>",
+        "confidence: <low|medium|high>",
+        "summary: <one-line summary>",
+        "- <finding>",
+        "- <action>",
+        "- <optional notes>",
+    ];
+    let hit_count = markers
+        .iter()
+        .filter(|marker| raw_block.contains(**marker))
+        .count();
+    hit_count >= 2
+}
+
+fn normalize_review_response_request_id(raw_block: &str, request_id: &str) -> String {
+    raw_block
+        .lines()
+        .map(|line| {
+            if line.trim_start().starts_with("request_id:") {
+                format!("request_id: {}", request_id)
+            } else {
+                line.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn parse_review_response_loop_control(raw_block: &str) -> Option<String> {
+    extract_latest_response_block_from_text(raw_block).and_then(|block| {
+        block.lines().find_map(|line| {
+            line.trim()
+                .strip_prefix("loop_control:")
+                .map(|value| value.trim().to_ascii_uppercase())
+        })
+    })
+}
+
+fn review_response_requests_loop_end(raw_block: &str) -> bool {
+    parse_review_response_loop_control(raw_block)
+        .map(|value| {
+            matches!(
+                value.as_str(),
+                REVIEW_LOOP_CONTROL_END | "END" | "DONE" | "CONVERGED" | "FINISH" | "FINISHED"
+            )
+        })
+        .unwrap_or(false)
 }
 
 fn kdl_string(value: &str) -> String {
@@ -373,12 +812,15 @@ fn send_acp_room_state_to_session(
     shared_id: &str,
 ) -> std::result::Result<(), String> {
     let endpoints = list_room_endpoints(shared_id).map_err(|e| e.to_string())?;
+    let automation_state = load_review_automation_state(shared_id);
     let counts = count_room_roles(&endpoints);
     let payload = serde_json::to_string(&json!({
         "room_id": shared_id,
         "driver_count": counts.driver_count,
         "reviewer_count": counts.reviewer_count,
         "human_count": counts.human_count,
+        "auto_review_enabled": automation_state.auto_review_enabled,
+        "auto_send_enabled": automation_state.auto_send_enabled,
     }))
     .map_err(|e| e.to_string())?;
     run_cli_action_in_session(
@@ -406,21 +848,33 @@ fn room_layout_string(
     endpoint: &EndpointMetadata,
     role_counts: RoomRoleCounts,
 ) -> String {
+    let automation_state = load_review_automation_state(&endpoint.shared_id);
     let shared_id_label = room_tab_label(shared_id);
     let shared_id = kdl_string(shared_id);
     let tab_label = kdl_string(&shared_id_label);
     let cwd = kdl_string(&cwd.display().to_string());
     let self_provider = kdl_string(&endpoint.provider);
     let self_role = kdl_string(&endpoint.role);
+    let auto_review_enabled = kdl_string(if automation_state.auto_review_enabled {
+        "true"
+    } else {
+        "false"
+    });
+    let auto_send_enabled = kdl_string(if automation_state.auto_send_enabled {
+        "true"
+    } else {
+        "false"
+    });
     let acp_bar = format!(
-        "        pane size=1 borderless=true {{\n            plugin location=\"zellij:acp-bar\" {{\n                room_id {shared_id}\n                self_provider {self_provider}\n                self_role {self_role}\n                driver_count {}\n                reviewer_count {}\n                human_count {}\n            }}\n        }}",
+        "        pane size=1 borderless=true {{\n            plugin location=\"zellij:acp-bar\" {{\n                room_id {shared_id}\n                self_provider {self_provider}\n                self_role {self_role}\n                driver_count {}\n                reviewer_count {}\n                human_count {}\n                auto_review_enabled {auto_review_enabled}\n                auto_send_enabled {auto_send_enabled}\n            }}\n        }}",
         role_counts.driver_count, role_counts.reviewer_count, role_counts.human_count
     );
     match provider_command {
         Some(provider_command) => {
             let command = kdl_string(provider_command);
+            let pane_name = kdl_string(endpoint.label.as_str());
             format!(
-                "layout {{\n    tab name={tab_label} focus=true {{\n        pane size=1 borderless=true {{\n            plugin location=\"tab-bar\"\n        }}\n        pane command={command} cwd={cwd} focus=true\n        pane size=1 borderless=true {{\n            plugin location=\"status-bar\"\n        }}\n{acp_bar}\n    }}\n}}"
+                "layout {{\n    tab name={tab_label} focus=true {{\n        pane size=1 borderless=true {{\n            plugin location=\"tab-bar\"\n        }}\n        pane command={command} cwd={cwd} name={pane_name} focus=true\n        pane size=1 borderless=true {{\n            plugin location=\"status-bar\"\n        }}\n{acp_bar}\n    }}\n}}"
             )
         },
         None => format!(
@@ -434,6 +888,7 @@ fn spawn_provider_pane(
     provider_command: &str,
     cwd: PathBuf,
     pane_name: Option<String>,
+    in_place: bool,
 ) -> Result<String, String> {
     let current_exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let mut command = process::Command::new(current_exe);
@@ -444,6 +899,9 @@ fn spawn_provider_pane(
         .arg("new-pane")
         .arg("--cwd")
         .arg(&cwd);
+    if in_place {
+        command.arg("--in-place").arg("--close-replaced-pane");
+    }
     if let Some(pane_name) = pane_name {
         command.arg("--name").arg(pane_name);
     }
@@ -465,6 +923,84 @@ fn spawn_provider_pane(
         ))
     } else {
         Ok(pane_id)
+    }
+}
+
+fn ensure_code_view_pane_in_session(
+    session_name: &str,
+    shared_id: &str,
+    cwd: &Path,
+) -> Result<(), String> {
+    let command_marker = format!("view code {}", shared_id);
+    let title_marker = format!("acp code {}", shared_id).to_lowercase();
+    let pane_exists = list_session_panes(session_name)?
+        .iter()
+        .filter(|entry| !entry.pane_info.is_plugin && !entry.pane_info.is_suppressed)
+        .any(|entry| {
+            entry
+                .pane_command
+                .as_deref()
+                .map(|command| command.contains(&command_marker))
+                .unwrap_or(false)
+                || entry
+                    .pane_info
+                    .title
+                    .to_lowercase()
+                    .contains(&title_marker)
+        });
+    if pane_exists {
+        return Ok(());
+    }
+
+    let current_exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let output = process::Command::new(current_exe)
+        .arg("--session")
+        .arg(session_name)
+        .arg("action")
+        .arg("new-pane")
+        .arg("--cwd")
+        .arg(cwd)
+        .arg("--name")
+        .arg(format!("acp code {}", shared_id))
+        .arg("--")
+        .arg("zellij")
+        .arg("view")
+        .arg("code")
+        .arg(shared_id)
+        .output()
+        .map_err(|e| e.to_string())?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        Err(if stderr.is_empty() {
+            format!(
+                "failed to spawn code view pane in session '{}' with status {}",
+                session_name, output.status
+            )
+        } else {
+            stderr
+        })
+    }
+}
+
+fn load_reviewer_prompt_override(
+    reviewer_prompt: Option<String>,
+    reviewer_prompt_file: Option<PathBuf>,
+) -> Result<Option<String>, String> {
+    let content = if let Some(prompt) = reviewer_prompt {
+        prompt
+    } else if let Some(path) = reviewer_prompt_file {
+        fs::read_to_string(&path)
+            .map_err(|e| format!("Failed to read reviewer prompt file '{}': {}", path.display(), e))?
+    } else {
+        return Ok(None);
+    };
+    let normalized = content.trim().to_owned();
+    if normalized.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(normalized))
     }
 }
 
@@ -507,43 +1043,61 @@ fn inject_reviewer_bootstrap_into_pane(
     Ok(())
 }
 
-fn focus_pane_in_session(session_name: &str, pane_id: &str) -> Result<(), String> {
-    run_cli_action_in_session(
-        session_name,
-        CliAction::FocusPaneId {
-            pane_id: pane_id.to_owned(),
-        },
-    )
-}
-
-fn close_current_launcher_pane_if_needed(
-    session_name: &str,
-    replacement_pane_id: &str,
-) -> Result<(), String> {
-    let Ok(current_pane_id) = std::env::var("ZELLIJ_PANE_ID") else {
-        return Ok(());
-    };
-    if current_pane_id == replacement_pane_id {
-        return Ok(());
-    }
-    run_cli_action_in_session(
-        session_name,
-        CliAction::ClosePane {
-            pane_id: Some(current_pane_id),
-        },
-    )
-}
-
 pub(crate) fn start_shared_room(
     mut opts: CliArgs,
     persona: AgentPersona,
     shared_id: Option<String>,
+    reviewer_count: Option<usize>,
+    reviewer_prompt: Option<String>,
+    reviewer_prompt_file: Option<PathBuf>,
+    provider_args: Option<String>,
 ) {
     let shared_id = resolve_default_room_id(shared_id);
     let current_session_name = envs::get_session_name().ok();
     let launched_inside_target_session =
         current_session_name.as_deref() == Some(shared_id.as_str());
     let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let reviewer_prompt_input_provided = reviewer_prompt.is_some() || reviewer_prompt_file.is_some();
+    let reviewer_prompt_override =
+        load_reviewer_prompt_override(reviewer_prompt, reviewer_prompt_file).unwrap_or_else(|e| {
+            eprintln!("{}", e);
+            process::exit(2);
+        });
+    crate::agent_control_plane::ensure_room(&shared_id).unwrap_or_else(|e| {
+        eprintln!("Failed to initialize shared room '{}': {}", shared_id, e);
+        process::exit(2);
+    });
+    if let Some(reviewer_count) = reviewer_count {
+        if reviewer_count == 0 {
+            eprintln!("--reviewer-count must be >= 1.");
+            process::exit(2);
+        }
+        if let Err(e) = set_room_reviewer_target_count(&shared_id, reviewer_count) {
+            eprintln!(
+                "Failed to persist reviewer_count for shared room '{}': {}",
+                shared_id, e
+            );
+            process::exit(2);
+        }
+    }
+    if reviewer_prompt_input_provided {
+        if let Err(e) = set_room_reviewer_prompt_override(&shared_id, reviewer_prompt_override.clone()) {
+            eprintln!(
+                "Failed to persist reviewer prompt for shared room '{}': {}",
+                shared_id, e
+            );
+            process::exit(2);
+        }
+    }
+    if provider_args.is_some() {
+        if let Err(e) = set_room_driver_provider_args(&shared_id, provider_args.clone()) {
+            eprintln!(
+                "Failed to persist provider args for shared room '{}': {}",
+                shared_id, e
+            );
+            process::exit(2);
+        }
+    }
     let participant = match register_participant(&shared_id, persona, &current_dir) {
         Ok(participant) => participant,
         Err(e) => {
@@ -551,14 +1105,16 @@ pub(crate) fn start_shared_room(
             process::exit(2);
         },
     };
+    // Auto-configure provider hooks for ACP integration
+    ensure_provider_hooks(persona);
     let _ = append_stream_event(
-        ViewStreamKind::Code,
+        ViewStreamKind::Events,
         &shared_id,
         "room_ready",
         Some(&participant.endpoint),
         format!(
-            "{} reserved the code stream for session '{}'",
-            participant.endpoint.provider, participant.session_name
+            "{} joined room '{}' as {}",
+            participant.endpoint.provider, shared_id, participant.endpoint.role
         ),
         json!({
             "cwd": participant.endpoint.cwd,
@@ -618,11 +1174,46 @@ pub(crate) fn start_shared_room(
                 shared_id
             );
         }
+        if reviewer_count.is_some() || reviewer_prompt_input_provided || provider_args.is_some() {
+            println!("");
+            if let Some(reviewer_count) = reviewer_count {
+                println!("Workspace reviewer count: {}", reviewer_count);
+            }
+            if reviewer_prompt_input_provided {
+                println!(
+                    "Workspace reviewer prompt: {}",
+                    if reviewer_prompt_override.is_some() {
+                        "customized"
+                    } else {
+                        "cleared (default prompt)"
+                    }
+                );
+            }
+            if let Some(provider_args) = provider_args.as_deref() {
+                println!("Workspace provider args: {}", provider_args);
+            }
+        }
     }
 
     let (provider_command, provider_cwd) =
         provider_context_for_persona(persona, &room_endpoints, &current_dir);
+    let provider_command =
+        apply_room_driver_provider_args(&shared_id, persona, provider_command);
     let session_active = room_session_is_active(&shared_id);
+
+    // Auto-start review automation before any early return
+    let _ = auto_enable_review_automation(&shared_id);
+
+    // Wrap provider command with ACP env vars so hooks work inside provider panes.
+    let wrapped_provider_command = provider_command.as_deref().map(|cmd| {
+        provider_wrapper_script(
+            &shared_id,
+            &participant.endpoint.endpoint_id,
+            &participant.endpoint.provider,
+            &participant.endpoint.role,
+            cmd,
+        )
+    });
 
     if participant.room_created || !session_active {
         opts.command = None;
@@ -633,23 +1224,25 @@ pub(crate) fn start_shared_room(
         };
         opts.layout = None;
         opts.new_session_with_layout = None;
-        opts.layout_string = Some(room_layout_string(
+        let layout = room_layout_string(
             &shared_id,
-            provider_command.as_deref(),
+            wrapped_provider_command.as_deref(),
             &provider_cwd,
             &participant.endpoint,
             room_role_counts,
-        ));
+        );
+        opts.layout_string = Some(layout);
         start_client(opts);
         return;
     }
 
-    if let Some(provider_command) = provider_command.as_deref() {
+    if let Some(provider_command) = wrapped_provider_command.as_deref() {
         match spawn_provider_pane(
             &shared_id,
             provider_command,
             provider_cwd.clone(),
             Some(participant.endpoint.label.clone()),
+            launched_inside_target_session,
         ) {
             Ok(pane_id) => {
                 if let Err(e) = update_endpoint_pane_binding(
@@ -674,10 +1267,6 @@ pub(crate) fn start_shared_room(
                         );
                     }
                 }
-                if launched_inside_target_session {
-                    let _ = focus_pane_in_session(&shared_id, &pane_id);
-                    let _ = close_current_launcher_pane_if_needed(&shared_id, &pane_id);
-                }
             },
             Err(e) => {
                 eprintln!(
@@ -686,6 +1275,19 @@ pub(crate) fn start_shared_room(
                 );
             },
         }
+    }
+
+    if let Err(e) = ensure_code_view_pane_in_session(&shared_id, &shared_id, &provider_cwd) {
+        let _ = append_stream_event(
+            ViewStreamKind::Events,
+            &shared_id,
+            "code_view_pane_spawn_failed",
+            Some(&participant.endpoint),
+            format!("Failed to auto-open code view pane in '{}'", shared_id),
+            json!({
+                "error": e,
+            }),
+        );
     }
 
     if let Err(e) = send_acp_room_state_to_session(&shared_id, &shared_id) {
@@ -715,10 +1317,10 @@ pub(crate) fn start_shared_room(
 
 pub(crate) fn view_shared_room(stream: ViewStreamKind, shared_id: Option<String>) {
     let shared_id = resolve_shared_room_id(shared_id);
-    let _ = crate::agent_control_plane::ensure_room(&shared_id).unwrap_or_else(|e| {
-        eprintln!("Failed to initialize shared room '{}': {}", shared_id, e);
+    if !crate::agent_control_plane::room_exists(&shared_id) {
+        eprintln!("Room '{}' does not exist.", shared_id);
         process::exit(2);
-    });
+    }
     let metadata = room_metadata(&shared_id).unwrap_or_else(|e| {
         eprintln!("Failed to read room metadata for '{}': {}", shared_id, e);
         process::exit(2);
@@ -739,6 +1341,19 @@ pub(crate) fn view_shared_room(stream: ViewStreamKind, shared_id: Option<String>
     println!(
         "Transport: {} | network: {}",
         metadata.bridge_transport, metadata.network_transport
+    );
+    println!(
+        "Workspace: reviewer_target={} | reviewer_prompt={} | provider_args={}",
+        metadata.reviewer_target_count.max(1),
+        if metadata.reviewer_prompt_override.is_some() {
+            "custom"
+        } else {
+            "default"
+        },
+        metadata
+            .driver_provider_args
+            .as_deref()
+            .unwrap_or("<none>")
     );
     println!("Participants:");
     for endpoint in endpoints {
@@ -984,6 +1599,230 @@ fn inject_review_request_into_reviewer(
     Ok(())
 }
 
+fn dispatch_review_request_to_reviewers(
+    shared_id: &str,
+    persisted: &PersistedReviewRequest,
+    print_output: bool,
+) {
+    if !room_session_is_active(shared_id) {
+        return;
+    }
+    match resolve_live_bound_reviewer_panes(shared_id, shared_id) {
+        Ok(reviewer_targets) if reviewer_targets.is_empty() => {
+            let _ = append_stream_event(
+                ViewStreamKind::Events,
+                shared_id,
+                "review_request_waiting_for_reviewer_delivery",
+                None,
+                format!(
+                    "Review request {} is waiting for reviewer delivery",
+                    persisted.request.request_id
+                ),
+                json!({
+                    "request_id": persisted.request.request_id,
+                    "reason": "no_live_bound_reviewer_panes",
+                }),
+            );
+            if print_output {
+                println!("No live reviewer panes were found. Request kept on disk.");
+            }
+        },
+        Ok(reviewer_targets) => {
+            for (endpoint, pane_id) in reviewer_targets {
+                match inject_review_request_into_reviewer(
+                    shared_id,
+                    &pane_id,
+                    &endpoint,
+                    &persisted.request.request_id,
+                    &persisted.text,
+                ) {
+                    Ok(()) => {
+                        if print_output {
+                            println!(
+                                "Injected review request into reviewer {} ({})",
+                                endpoint.endpoint_id, pane_id
+                            );
+                        }
+                    },
+                    Err(e) => {
+                        let _ = append_stream_event(
+                            ViewStreamKind::Events,
+                            shared_id,
+                            "review_request_waiting_for_reviewer_delivery",
+                            Some(&endpoint),
+                            format!(
+                                "Review request {} is waiting for reviewer delivery",
+                                persisted.request.request_id
+                            ),
+                            json!({
+                                "request_id": persisted.request.request_id,
+                                "target_pane_id": pane_id,
+                                "reason": "reviewer_injection_failed",
+                                "error": e,
+                            }),
+                        );
+                        if print_output {
+                            println!(
+                                "Could not inject request into reviewer {} ({}). Request kept on disk.",
+                                endpoint.endpoint_id, pane_id
+                            );
+                        }
+                    },
+                }
+            }
+        },
+        Err(e) => {
+            let _ = append_stream_event(
+                ViewStreamKind::Events,
+                shared_id,
+                "review_request_waiting_for_reviewer_delivery",
+                None,
+                format!(
+                    "Review request {} is waiting for reviewer delivery",
+                    persisted.request.request_id
+                ),
+                json!({
+                    "request_id": persisted.request.request_id,
+                    "reason": "reviewer_pane_query_failed",
+                    "error": e,
+                }),
+            );
+            if print_output {
+                println!("Could not inspect reviewer panes yet. Request kept on disk.");
+            }
+        },
+    }
+}
+
+fn dispatch_persisted_feedback_to_driver(
+    shared_id: &str,
+    persisted: &PersistedReviewFeedback,
+    auto_send_enabled: bool,
+    print_output: bool,
+) {
+    let Some(driver_envelope) = persisted.driver_envelope.as_deref() else {
+        return;
+    };
+    if !auto_send_enabled {
+        let _ = append_stream_event(
+            ViewStreamKind::Events,
+            shared_id,
+            "review_feedback_waiting_for_driver_delivery",
+            None,
+            format!(
+                "Feedback {} is waiting for driver delivery",
+                persisted.feedback.request_id
+            ),
+            json!({
+                "request_id": persisted.feedback.request_id,
+                "target_pane_id": persisted.target_pane_id,
+                "reason": "auto_send_disabled",
+            }),
+        );
+        if print_output {
+            println!("Auto-send is disabled. Envelope kept on disk.");
+        }
+        return;
+    }
+    if room_session_is_active(shared_id) {
+        match resolve_driver_delivery_pane(shared_id, persisted.target_pane_id.as_deref()) {
+            Ok(Some(target_pane_id)) => {
+                if let Err(e) = inject_review_feedback_into_driver(
+                    shared_id,
+                    &target_pane_id,
+                    driver_envelope,
+                    &persisted.feedback.request_id,
+                    &persisted.feedback.source_endpoint,
+                ) {
+                    let _ = append_stream_event(
+                        ViewStreamKind::Events,
+                        shared_id,
+                        "review_feedback_waiting_for_driver_delivery",
+                        None,
+                        format!(
+                            "Feedback {} is waiting for driver delivery",
+                            persisted.feedback.request_id
+                        ),
+                        json!({
+                            "request_id": persisted.feedback.request_id,
+                            "target_pane_id": persisted.target_pane_id,
+                            "reason": "driver_injection_failed",
+                            "error": e,
+                        }),
+                    );
+                    if print_output {
+                        println!("Failed to inject driver envelope. Envelope kept on disk.");
+                    }
+                } else if print_output {
+                    println!("Injected driver envelope into: {}", target_pane_id);
+                }
+            },
+            Ok(None) => {
+                let _ = append_stream_event(
+                    ViewStreamKind::Events,
+                    shared_id,
+                    "review_feedback_waiting_for_driver_delivery",
+                    None,
+                    format!(
+                        "Feedback {} is waiting for driver delivery",
+                        persisted.feedback.request_id
+                    ),
+                    json!({
+                        "request_id": persisted.feedback.request_id,
+                        "target_pane_id": persisted.target_pane_id,
+                        "reason": "target_pane_not_resolved",
+                    }),
+                );
+                if print_output {
+                    println!(
+                        "Driver pane not resolved. Envelope kept on disk for manual delivery."
+                    );
+                }
+            },
+            Err(e) => {
+                let _ = append_stream_event(
+                    ViewStreamKind::Events,
+                    shared_id,
+                    "review_feedback_waiting_for_driver_delivery",
+                    None,
+                    format!(
+                        "Feedback {} is waiting for driver delivery",
+                        persisted.feedback.request_id
+                    ),
+                    json!({
+                        "request_id": persisted.feedback.request_id,
+                        "target_pane_id": persisted.target_pane_id,
+                        "reason": "pane_query_failed",
+                        "error": e,
+                    }),
+                );
+                if print_output {
+                    println!("Could not inspect session panes yet. Envelope kept on disk.");
+                }
+            },
+        }
+    } else {
+        let _ = append_stream_event(
+            ViewStreamKind::Events,
+            shared_id,
+            "review_feedback_waiting_for_driver_delivery",
+            None,
+            format!(
+                "Feedback {} is waiting for driver delivery",
+                persisted.feedback.request_id
+            ),
+            json!({
+                "request_id": persisted.feedback.request_id,
+                "target_pane_id": persisted.target_pane_id,
+                "reason": "session_not_active",
+            }),
+        );
+        if print_output {
+            println!("Room session is not active. Envelope kept on disk.");
+        }
+    }
+}
+
 pub(crate) fn prepare_room_review_request(shared_id: Option<String>) {
     let shared_id = resolve_shared_room_id(shared_id);
     if room_session_is_active(&shared_id) {
@@ -1006,83 +1845,7 @@ pub(crate) fn prepare_room_review_request(shared_id: Option<String>) {
     println!("{}", persisted.text);
     println!("Saved request JSON: {}", persisted.json_path.display());
     println!("Saved request text: {}", persisted.text_path.display());
-    if room_session_is_active(&shared_id) {
-        match resolve_live_bound_reviewer_panes(&shared_id, &shared_id) {
-            Ok(reviewer_targets) if reviewer_targets.is_empty() => {
-                let _ = append_stream_event(
-                    ViewStreamKind::Events,
-                    &shared_id,
-                    "review_request_waiting_for_reviewer_delivery",
-                    None,
-                    format!(
-                        "Review request {} is waiting for reviewer delivery",
-                        persisted.request.request_id
-                    ),
-                    json!({
-                        "request_id": persisted.request.request_id,
-                        "reason": "no_live_bound_reviewer_panes",
-                    }),
-                );
-                println!("No live reviewer panes were found. Request kept on disk.");
-            },
-            Ok(reviewer_targets) => {
-                for (endpoint, pane_id) in reviewer_targets {
-                    match inject_review_request_into_reviewer(
-                        &shared_id,
-                        &pane_id,
-                        &endpoint,
-                        &persisted.request.request_id,
-                        &persisted.text,
-                    ) {
-                        Ok(()) => println!(
-                            "Injected review request into reviewer {} ({})",
-                            endpoint.endpoint_id, pane_id
-                        ),
-                        Err(e) => {
-                            let _ = append_stream_event(
-                                ViewStreamKind::Events,
-                                &shared_id,
-                                "review_request_waiting_for_reviewer_delivery",
-                                Some(&endpoint),
-                                format!(
-                                    "Review request {} is waiting for reviewer delivery",
-                                    persisted.request.request_id
-                                ),
-                                json!({
-                                    "request_id": persisted.request.request_id,
-                                    "target_pane_id": pane_id,
-                                    "reason": "reviewer_injection_failed",
-                                    "error": e,
-                                }),
-                            );
-                            println!(
-                                "Could not inject request into reviewer {} ({}). Request kept on disk.",
-                                endpoint.endpoint_id, pane_id
-                            );
-                        },
-                    }
-                }
-            },
-            Err(e) => {
-                let _ = append_stream_event(
-                    ViewStreamKind::Events,
-                    &shared_id,
-                    "review_request_waiting_for_reviewer_delivery",
-                    None,
-                    format!(
-                        "Review request {} is waiting for reviewer delivery",
-                        persisted.request.request_id
-                    ),
-                    json!({
-                        "request_id": persisted.request.request_id,
-                        "reason": "reviewer_pane_query_failed",
-                        "error": e,
-                    }),
-                );
-                println!("Could not inspect reviewer panes yet. Request kept on disk.");
-            },
-        }
-    }
+    dispatch_review_request_to_reviewers(&shared_id, &persisted, true);
 }
 
 pub(crate) fn record_room_review_feedback(
@@ -1129,85 +1892,541 @@ pub(crate) fn record_room_review_feedback(
     println!("{}", persisted.text);
     println!("Saved feedback JSON: {}", persisted.json_path.display());
     println!("Saved feedback text: {}", persisted.text_path.display());
-    if let Some(driver_envelope_path) = persisted.driver_envelope_path {
+    if let Some(ref driver_envelope_path) = persisted.driver_envelope_path {
         println!("Saved driver envelope: {}", driver_envelope_path.display());
     }
-    if let Some(driver_envelope) = persisted.driver_envelope.as_deref() {
-        if room_session_is_active(&shared_id) {
-            match resolve_driver_delivery_pane(&shared_id, persisted.target_pane_id.as_deref()) {
-                Ok(Some(target_pane_id)) => {
-                    inject_review_feedback_into_driver(
-                        &shared_id,
-                        &target_pane_id,
-                        driver_envelope,
-                        &persisted.feedback.request_id,
-                        &persisted.feedback.source_endpoint,
-                    )
-                    .unwrap_or_else(|e| {
-                        eprintln!("Failed to inject driver envelope: {}", e);
-                        process::exit(2);
-                    });
-                    println!("Injected driver envelope into: {}", target_pane_id);
-                },
-                Ok(None) => {
-                    let _ = append_stream_event(
-                        ViewStreamKind::Events,
-                        &shared_id,
-                        "review_feedback_waiting_for_driver_delivery",
-                        None,
-                        format!(
-                            "Feedback {} is waiting for driver delivery",
-                            persisted.feedback.request_id
-                        ),
-                        json!({
-                            "request_id": persisted.feedback.request_id,
-                            "target_pane_id": persisted.target_pane_id,
-                            "reason": "target_pane_not_resolved",
-                        }),
-                    );
-                    println!(
-                        "Driver pane not resolved. Envelope kept on disk for manual delivery."
-                    );
-                },
-                Err(e) => {
-                    let _ = append_stream_event(
-                        ViewStreamKind::Events,
-                        &shared_id,
-                        "review_feedback_waiting_for_driver_delivery",
-                        None,
-                        format!(
-                            "Feedback {} is waiting for driver delivery",
-                            persisted.feedback.request_id
-                        ),
-                        json!({
-                            "request_id": persisted.feedback.request_id,
-                            "target_pane_id": persisted.target_pane_id,
-                            "reason": "pane_query_failed",
-                            "error": e,
-                        }),
-                    );
-                    println!("Could not inspect session panes yet. Envelope kept on disk.");
-                },
-            }
-        } else {
-            let _ = append_stream_event(
-                ViewStreamKind::Events,
-                &shared_id,
-                "review_feedback_waiting_for_driver_delivery",
-                None,
-                format!(
-                    "Feedback {} is waiting for driver delivery",
-                    persisted.feedback.request_id
-                ),
-                json!({
-                    "request_id": persisted.feedback.request_id,
-                    "target_pane_id": persisted.target_pane_id,
-                    "reason": "session_not_active",
-                }),
-            );
-            println!("Room session is not active. Envelope kept on disk.");
-        }
+    dispatch_persisted_feedback_to_driver(&shared_id, &persisted, true, true);
+}
+
+fn refresh_room_state_bar(shared_id: &str) {
+    if !room_session_is_active(shared_id) {
+        return;
     }
+    if let Err(e) = send_acp_room_state_to_session(shared_id, shared_id) {
+        let _ = append_stream_event(
+            ViewStreamKind::Events,
+            shared_id,
+            "acp_bar_update_failed",
+            None,
+            format!("Failed to update ACP bar in '{}'", shared_id),
+            json!({
+                "error": e,
+            }),
+        );
+    }
+}
+
+fn auto_enable_review_automation(shared_id: &str) -> Result<(), String> {
+    let mut state = load_review_automation_state(shared_id);
+    if state.auto_review_enabled {
+        if state.worker_started_at.is_none() {
+            state.worker_started_at = Some(timestamp_now());
+            let _ = save_review_automation_state(shared_id, state);
+        }
+        return spawn_review_automation_worker_process(shared_id);
+    }
+    state.auto_review_enabled = true;
+    state.auto_send_enabled = true;
+    state.worker_started_at = Some(timestamp_now());
+    let _ = save_review_automation_state(shared_id, state);
+    spawn_review_automation_worker_process(shared_id)
+}
+
+fn spawn_review_automation_worker_process(shared_id: &str) -> Result<(), String> {
+    let lock_path = review_automation_worker_lock_path(shared_id);
+    if lock_path.exists() {
+        if let Some(pid) = read_review_worker_lock_pid(&lock_path) {
+            if process_id_is_alive(pid) {
+                return Ok(());
+            }
+        }
+        let _ = fs::remove_file(&lock_path);
+    }
+    let current_exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    process::Command::new(current_exe)
+        .arg("--session")
+        .arg(shared_id)
+        .arg("review")
+        .arg("auto-worker")
+        .arg(shared_id)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn read_review_worker_lock_pid(lock_path: &Path) -> Option<u32> {
+    let raw = fs::read_to_string(lock_path).ok()?;
+    raw.lines().find_map(|line| {
+        line.trim()
+            .strip_prefix("pid=")
+            .and_then(|value| value.parse::<u32>().ok())
+    })
+}
+
+fn process_id_is_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    process::Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn try_acquire_review_worker_lock(shared_id: &str) -> Result<bool, String> {
+    let lock_path = review_automation_worker_lock_path(shared_id);
+    if let Some(parent) = lock_path.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let open_lock = || {
+        fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&lock_path)
+    };
+    match open_lock() {
+        Ok(mut file) => {
+            let _ = writeln!(file, "pid={}", std::process::id());
+            Ok(true)
+        },
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            if let Some(pid) = read_review_worker_lock_pid(&lock_path) {
+                if process_id_is_alive(pid) {
+                    return Ok(false);
+                }
+            }
+            let _ = fs::remove_file(&lock_path);
+            match open_lock() {
+                Ok(mut file) => {
+                    let _ = writeln!(file, "pid={}", std::process::id());
+                    Ok(true)
+                },
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(false),
+                Err(e) => Err(e.to_string()),
+            }
+        },
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+fn review_worker_is_running(shared_id: &str) -> bool {
+    let lock_path = review_automation_worker_lock_path(shared_id);
+    if !lock_path.exists() {
+        return false;
+    }
+    let Some(pid) = read_review_worker_lock_pid(&lock_path) else {
+        return false;
+    };
+    process_id_is_alive(pid)
+}
+
+fn release_review_worker_lock(shared_id: &str) {
+    let _ = fs::remove_file(review_automation_worker_lock_path(shared_id));
+}
+
+fn resolve_primary_driver_endpoint(shared_id: &str) -> Result<Option<EndpointMetadata>, String> {
+    let endpoints = list_room_endpoints(shared_id).map_err(|e| e.to_string())?;
+    Ok(endpoints.into_iter().rev().find(|endpoint| {
+        endpoint.role == "driver"
+            && terminal_provider_command(&endpoint.provider).is_some()
+            && endpoint.bound_pane_id.is_some()
+    }))
+}
+
+fn ensure_auto_reviewer_running(
+    shared_id: &str,
+    driver_endpoint: &EndpointMetadata,
+) -> Result<bool, String> {
+    if !room_session_is_active(shared_id) {
+        return Ok(false);
+    }
+    let reviewer_cwd = PathBuf::from(&driver_endpoint.cwd);
+    let reviewer_endpoint = register_participant(shared_id, AgentPersona::Reviewer, &reviewer_cwd)
+        .map_err(|e| e.to_string())?
+        .endpoint;
+    let provider_command = terminal_provider_command(&driver_endpoint.provider).unwrap_or("claude");
+    let wrapped_provider_command = provider_wrapper_script(
+        shared_id,
+        &reviewer_endpoint.endpoint_id,
+        &reviewer_endpoint.provider,
+        &reviewer_endpoint.role,
+        provider_command,
+    );
+    let pane_id = spawn_provider_pane(
+        shared_id,
+        &wrapped_provider_command,
+        PathBuf::from(&reviewer_endpoint.cwd),
+        Some(reviewer_endpoint.label.clone()),
+        false,
+    )?;
+    update_endpoint_pane_binding(shared_id, &reviewer_endpoint.endpoint_id, &pane_id)
+        .map_err(|e| e.to_string())?;
+    let _ = inject_reviewer_bootstrap_into_pane(shared_id, &pane_id, &reviewer_endpoint);
+    let _ = ensure_code_view_pane_in_session(shared_id, shared_id, Path::new(&driver_endpoint.cwd));
+    let _ = send_acp_room_state_to_session(shared_id, shared_id);
+    let _ = append_stream_event(
+        ViewStreamKind::Events,
+        shared_id,
+        "auto_reviewer_spawned",
+        Some(&reviewer_endpoint),
+        format!(
+            "Auto-started reviewer {} on {}",
+            reviewer_endpoint.endpoint_id, pane_id
+        ),
+        json!({
+            "endpoint_id": reviewer_endpoint.endpoint_id,
+            "target_pane_id": pane_id,
+        }),
+    );
+    Ok(true)
+}
+
+pub(crate) fn start_room_review_automation(shared_id: Option<String>) {
+    let shared_id = resolve_shared_room_id(shared_id);
+    if !crate::agent_control_plane::room_exists(&shared_id) {
+        eprintln!("Room '{}' does not exist.", shared_id);
+        process::exit(2);
+    }
+    let mut state = load_review_automation_state(&shared_id);
+    state.auto_review_enabled = true;
+    state.auto_send_enabled = true;
+    if state.worker_started_at.is_none() {
+        state.worker_started_at = Some(timestamp_now());
+    }
+    let state = save_review_automation_state(&shared_id, state).unwrap_or_else(|e| {
+        eprintln!(
+            "Failed to update review automation state for room '{}': {}",
+            shared_id, e
+        );
+        process::exit(2);
+    });
+    spawn_review_automation_worker_process(&shared_id).unwrap_or_else(|e| {
+        eprintln!(
+            "Failed to start review automation worker for room '{}': {}",
+            shared_id, e
+        );
+        process::exit(2);
+    });
+    refresh_room_state_bar(&shared_id);
+    println!("Review automation enabled for room '{}'.", shared_id);
+    println!(
+        "Auto-send: {}",
+        if state.auto_send_enabled { "on" } else { "off" }
+    );
+}
+
+pub(crate) fn stop_room_review_automation(shared_id: Option<String>) {
+    let shared_id = resolve_shared_room_id(shared_id);
+    if !crate::agent_control_plane::room_exists(&shared_id) {
+        eprintln!("Room '{}' does not exist.", shared_id);
+        process::exit(2);
+    }
+    let mut state = load_review_automation_state(&shared_id);
+    state.auto_review_enabled = false;
+    let state = save_review_automation_state(&shared_id, state).unwrap_or_else(|e| {
+        eprintln!(
+            "Failed to update review automation state for room '{}': {}",
+            shared_id, e
+        );
+        process::exit(2);
+    });
+    refresh_room_state_bar(&shared_id);
+    println!("Review automation disabled for room '{}'.", shared_id);
+    println!(
+        "Auto-send remains {}.",
+        if state.auto_send_enabled { "on" } else { "off" }
+    );
+}
+
+pub(crate) fn set_room_review_auto_send(shared_id: Option<String>, enabled: bool) {
+    let shared_id = resolve_shared_room_id(shared_id);
+    if !crate::agent_control_plane::room_exists(&shared_id) {
+        eprintln!("Room '{}' does not exist.", shared_id);
+        process::exit(2);
+    }
+    let mut state = load_review_automation_state(&shared_id);
+    state.auto_send_enabled = enabled;
+    save_review_automation_state(&shared_id, state).unwrap_or_else(|e| {
+        eprintln!(
+            "Failed to update review automation state for room '{}': {}",
+            shared_id, e
+        );
+        process::exit(2);
+    });
+    refresh_room_state_bar(&shared_id);
+    println!(
+        "Review auto-send for room '{}' is now {}.",
+        shared_id,
+        if enabled { "on" } else { "off" }
+    );
+}
+
+pub(crate) fn print_room_review_automation_status(shared_id: Option<String>) {
+    let shared_id = resolve_shared_room_id(shared_id);
+    if !crate::agent_control_plane::room_exists(&shared_id) {
+        eprintln!("Room '{}' does not exist.", shared_id);
+        process::exit(2);
+    }
+    let state = load_review_automation_state(&shared_id);
+    let worker_running = review_worker_is_running(&shared_id);
+    println!("Room: {}", shared_id);
+    println!(
+        "Auto review: {}",
+        if state.auto_review_enabled {
+            "on"
+        } else {
+            "off"
+        }
+    );
+    println!(
+        "Auto send: {}",
+        if state.auto_send_enabled { "on" } else { "off" }
+    );
+    println!(
+        "Worker: {}",
+        if worker_running { "running" } else { "stopped" }
+    );
+    if let Ok(metadata) = room_metadata(&shared_id) {
+        println!(
+            "Workspace reviewer target: {}",
+            metadata.reviewer_target_count.max(1)
+        );
+        println!(
+            "Workspace reviewer prompt: {}",
+            if metadata.reviewer_prompt_override.is_some() {
+                "custom"
+            } else {
+                "default"
+            }
+        );
+        println!(
+            "Workspace provider args: {}",
+            metadata
+                .driver_provider_args
+                .as_deref()
+                .unwrap_or("<none>")
+        );
+    }
+    if let Some(last_request_id) = state.last_request_id {
+        println!("Last request: {}", last_request_id);
+    }
+    if let Some(active_request_id) = state.active_request_id {
+        println!("Pending request: {}", active_request_id);
+    }
+    if let Some(active_request_started_at) = state.active_request_started_at {
+        println!("Pending since: {}", active_request_started_at);
+    }
+    if let Some(updated_at) = Some(state.updated_at) {
+        println!("Updated at: {}", updated_at);
+    }
+}
+
+pub(crate) fn run_room_review_automation_worker(shared_id: Option<String>) {
+    let shared_id = resolve_shared_room_id(shared_id);
+    if !crate::agent_control_plane::room_exists(&shared_id) {
+        return;
+    }
+    let acquired_lock = try_acquire_review_worker_lock(&shared_id).unwrap_or(false);
+    if !acquired_lock {
+        return;
+    }
+    let mut state = load_review_automation_state(&shared_id);
+    state.worker_started_at = Some(timestamp_now());
+    let _ = save_review_automation_state(&shared_id, state.clone());
+    loop {
+        state = load_review_automation_state(&shared_id);
+        if !state.auto_review_enabled {
+            break;
+        }
+        if let Some(active_request_id) = state.active_request_id.clone() {
+            let timed_out = state
+                .active_request_started_at
+                .as_deref()
+                .map(review_request_timed_out)
+                .unwrap_or(false);
+            if timed_out {
+                let _ = append_stream_event(
+                    ViewStreamKind::Events,
+                    &shared_id,
+                    "review_request_timed_out",
+                    None,
+                    format!(
+                        "Timed out waiting for reviewer response for {}",
+                        active_request_id
+                    ),
+                    json!({
+                        "request_id": active_request_id,
+                        "timeout_secs": REVIEW_REQUEST_TIMEOUT_SECS,
+                    }),
+                );
+                state.active_request_id = None;
+                state.active_request_started_at = None;
+                let _ = save_review_automation_state(&shared_id, state.clone());
+            }
+        }
+        if room_session_is_active(&shared_id) {
+            let _ = backfill_driver_pane_binding_from_live_room(&shared_id, &shared_id);
+        }
+        let driver_endpoint = match resolve_primary_driver_endpoint(&shared_id) {
+            Ok(driver_endpoint) => driver_endpoint,
+            Err(_) => {
+                thread::sleep(Duration::from_millis(REVIEW_AUTOMATION_POLL_MS));
+                continue;
+            },
+        };
+        let Some(driver_endpoint) = driver_endpoint else {
+            thread::sleep(Duration::from_millis(REVIEW_AUTOMATION_POLL_MS));
+            continue;
+        };
+        let Some(driver_pane_id) = driver_endpoint.bound_pane_id.clone() else {
+            thread::sleep(Duration::from_millis(REVIEW_AUTOMATION_POLL_MS));
+            continue;
+        };
+        let reviewer_target_count = room_metadata(&shared_id)
+            .map(|metadata| metadata.reviewer_target_count.max(1))
+            .unwrap_or(1);
+        let mut reviewer_targets = match resolve_live_bound_reviewer_panes(&shared_id, &shared_id)
+        {
+            Ok(reviewer_targets) => reviewer_targets,
+            Err(_) => {
+                thread::sleep(Duration::from_millis(REVIEW_AUTOMATION_POLL_MS));
+                continue;
+            },
+        };
+        reviewer_targets = if reviewer_targets.len() < reviewer_target_count {
+            let missing = reviewer_target_count.saturating_sub(reviewer_targets.len());
+            for _ in 0..missing {
+                let _ = ensure_auto_reviewer_running(&shared_id, &driver_endpoint);
+            }
+            resolve_live_bound_reviewer_panes(&shared_id, &shared_id).unwrap_or_default()
+        } else {
+            reviewer_targets
+        };
+        if reviewer_targets.is_empty() {
+            thread::sleep(Duration::from_millis(REVIEW_AUTOMATION_POLL_MS));
+            continue;
+        }
+
+        if let Ok(Some(turn_state)) = driver_turn_state(
+            &shared_id,
+            &driver_pane_id,
+            &driver_endpoint.endpoint_id,
+        ) {
+            let idle_for = SystemTime::now()
+                .duration_since(turn_state.latest_event_at)
+                .unwrap_or_default();
+            if idle_for >= Duration::from_secs(REVIEW_AUTOMATION_IDLE_SECS)
+                && state.active_request_id.is_none()
+                && state.last_driver_fingerprint.as_deref() != Some(turn_state.fingerprint.as_str())
+            {
+                if let Ok(persisted) = prepare_review_request(&shared_id) {
+                    dispatch_review_request_to_reviewers(&shared_id, &persisted, false);
+                    state.last_driver_fingerprint = Some(turn_state.fingerprint.clone());
+                    state.last_request_id = Some(persisted.request.request_id.clone());
+                    state.active_request_id = Some(persisted.request.request_id.clone());
+                    state.active_request_started_at = Some(timestamp_now());
+                    let _ = save_review_automation_state(&shared_id, state.clone());
+                }
+            }
+        }
+
+        let reviewer_pane_ids: HashSet<String> = reviewer_targets
+            .iter()
+            .map(|(_, pane_id)| pane_id.clone())
+            .collect();
+        let tracked_request_id = state.active_request_id.clone();
+        if let Some(tracked_request_id) = tracked_request_id {
+            if let Ok(Some((block, source_pane_id, snapshot_time))) =
+                latest_reviewer_response_block(&shared_id, &reviewer_pane_ids)
+            {
+                if !snapshot_is_fresh_for_request(
+                    &snapshot_time,
+                    state.active_request_started_at.as_deref(),
+                ) {
+                    thread::sleep(Duration::from_millis(REVIEW_AUTOMATION_POLL_MS));
+                    continue;
+                }
+                let parsed_request_id = parse_review_response_request_id(&block);
+                let request_matches = parsed_request_id
+                    .as_deref()
+                    .map(|request_id| {
+                        request_id == tracked_request_id.as_str()
+                            || (is_placeholder_request_id(request_id)
+                                && !reviewer_response_is_unfilled_template(&block))
+                    })
+                    .unwrap_or(false);
+                if request_matches {
+                    let normalized_block = parsed_request_id
+                        .as_deref()
+                        .filter(|request_id| is_placeholder_request_id(request_id))
+                        .map(|_| normalize_review_response_request_id(&block, &tracked_request_id))
+                        .unwrap_or_else(|| block.clone());
+                    let stop_requested = review_response_requests_loop_end(&normalized_block);
+                    let block_fingerprint = stable_fingerprint(&block);
+                    if state.last_response_fingerprint.as_deref()
+                        != Some(block_fingerprint.as_str())
+                    {
+                        let source_endpoint_override = reviewer_targets
+                            .iter()
+                            .find(|(_, pane_id)| pane_id == &source_pane_id)
+                            .map(|(endpoint, _)| endpoint.endpoint_id.as_str());
+                        if let Ok(persisted_feedback) =
+                            record_review_feedback(
+                                &shared_id,
+                                &normalized_block,
+                                source_endpoint_override,
+                            )
+                        {
+                            dispatch_persisted_feedback_to_driver(
+                                &shared_id,
+                                &persisted_feedback,
+                                state.auto_send_enabled,
+                                false,
+                            );
+                            state.last_response_fingerprint = Some(block_fingerprint);
+                            if state.active_request_id.as_deref()
+                                == Some(persisted_feedback.feedback.request_id.as_str())
+                            {
+                                state.active_request_id = None;
+                                state.active_request_started_at = None;
+                            }
+                            if stop_requested {
+                                state.auto_review_enabled = false;
+                                let _ = append_stream_event(
+                                    ViewStreamKind::Events,
+                                    &shared_id,
+                                    "review_loop_converged",
+                                    None,
+                                    format!(
+                                        "Reviewer requested convergence on {}",
+                                        persisted_feedback.feedback.request_id
+                                    ),
+                                    json!({
+                                        "request_id": persisted_feedback.feedback.request_id,
+                                        "loop_control": REVIEW_LOOP_CONTROL_END,
+                                    }),
+                                );
+                            }
+                            let _ = save_review_automation_state(&shared_id, state.clone());
+                            if stop_requested {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        thread::sleep(Duration::from_millis(REVIEW_AUTOMATION_POLL_MS));
+    }
+    release_review_worker_lock(&shared_id);
 }
 
 #[cfg(feature = "web_server_capability")]
@@ -2161,5 +3380,108 @@ mod tests {
 
         assert_eq!(resolved.len(), 6);
         assert!(resolved.chars().all(|c| c.is_ascii_digit()));
+    }
+
+    #[test]
+    fn extracts_latest_review_response_block_from_snapshot_text() {
+        let text = r#"
+[ACP_REVIEW_RESPONSE_V1]
+request_id: rr-0001
+summary: old
+[/ACP_REVIEW_RESPONSE_V1]
+
+noise
+
+[ACP_REVIEW_RESPONSE_V1]
+request_id: rr-0002
+summary: latest
+[/ACP_REVIEW_RESPONSE_V1]
+"#;
+
+        let block = extract_latest_response_block_from_text(text).unwrap();
+
+        assert!(block.contains("request_id: rr-0002"));
+        assert!(block.contains("summary: latest"));
+    }
+
+    #[test]
+    fn parses_request_id_from_review_response_block() {
+        let block = r#"
+[ACP_REVIEW_RESPONSE_V1]
+room_id: demo
+request_id: rr-0042
+summary: ok
+[/ACP_REVIEW_RESPONSE_V1]
+"#;
+
+        assert_eq!(
+            parse_review_response_request_id(block).as_deref(),
+            Some("rr-0042")
+        );
+    }
+
+    #[test]
+    fn detects_unfilled_reviewer_template_response() {
+        let block = r#"
+[ACP_REVIEW_RESPONSE_V1]
+room_id: demo
+request_id: <request_id>
+source_endpoint: reviewer-1
+target_role: driver
+severity: <low|medium|high>
+confidence: <low|medium|high>
+should_send: true
+summary: <one-line summary>
+
+findings:
+- <finding>
+
+actions:
+- <action>
+[/ACP_REVIEW_RESPONSE_V1]
+"#;
+
+        assert!(reviewer_response_is_unfilled_template(block));
+    }
+
+    #[test]
+    fn does_not_mark_filled_reviewer_response_as_template() {
+        let block = r#"
+[ACP_REVIEW_RESPONSE_V1]
+room_id: demo
+request_id: rr-0042
+source_endpoint: reviewer-1
+target_role: driver
+severity: low
+confidence: high
+should_send: true
+summary: Looks good
+
+findings:
+- no regression found
+[/ACP_REVIEW_RESPONSE_V1]
+"#;
+
+        assert!(!reviewer_response_is_unfilled_template(block));
+    }
+
+    #[test]
+    fn parses_loop_control_and_detects_end_review() {
+        let block = r#"
+[ACP_REVIEW_RESPONSE_V1]
+room_id: demo
+request_id: rr-0042
+source_endpoint: reviewer-1
+target_role: driver
+loop_control: END_REVIEW
+summary: done
+[/ACP_REVIEW_RESPONSE_V1]
+"#;
+
+        assert_eq!(
+            parse_review_response_loop_control(block).as_deref(),
+            Some("END_REVIEW")
+        );
+        assert!(review_response_requests_loop_end(block));
     }
 }

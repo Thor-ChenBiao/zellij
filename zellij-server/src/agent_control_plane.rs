@@ -17,16 +17,26 @@ pub(crate) struct StreamEmission {
 pub(crate) enum AcpSpecialCommand {
     EnsureRoom,
     LaunchProvider { provider: String },
+    PrefixWithZellij,
+    LaunchViewPane { stream: String, room_id: Option<String> },
 }
+
+use std::collections::HashSet;
 
 #[derive(Default)]
 pub(crate) struct RoomTelemetry {
     pane_viewport_hashes: HashMap<PaneId, u64>,
     pty_line_buffers: HashMap<u32, String>,
     pane_input_buffers: HashMap<PaneId, String>,
+    last_committed_inputs: HashMap<PaneId, String>,
+    seen_viewport_tool_calls: HashSet<String>,
 }
 
 impl RoomTelemetry {
+    pub fn last_committed_input(&self, pane_id: PaneId) -> Option<String> {
+        self.last_committed_inputs.get(&pane_id).cloned()
+    }
+
     pub fn ingest_pty_bytes(&mut self, terminal_id: u32, raw_bytes: &[u8]) -> Vec<StreamEmission> {
         let sanitized = sanitize_terminal_output(raw_bytes);
         if sanitized.is_empty() {
@@ -55,29 +65,27 @@ impl RoomTelemetry {
                         "line": trimmed,
                     }),
                 });
-                if let Some(file_hint) = extract_file_hint(trimmed) {
-                    emissions.push(StreamEmission {
-                        stream: ViewStreamKind::Code,
-                        kind: "file_hint".to_owned(),
-                        message: format!("Detected file hint {}", file_hint),
-                        payload: json!({
-                            "terminal_id": terminal_id,
-                            "file_path": file_hint,
-                            "source_line": trimmed,
-                        }),
-                    });
+                // Edit/Write tool calls also emit to code stream with file content
+                if matches!(tool.as_str(), "Edit" | "Write" | "MultiEdit") {
+                    if let Some(file_path) = extract_file_path_from_tool_value(&value) {
+                        let diff_context = read_file_context_for_code_stream(&file_path);
+                        emissions.push(StreamEmission {
+                            stream: ViewStreamKind::Code,
+                            kind: "code_change".to_owned(),
+                            message: format!(
+                                "━━━ {}: {} ━━━",
+                                tool,
+                                file_path
+                            ),
+                            payload: json!({
+                                "terminal_id": terminal_id,
+                                "tool": tool,
+                                "file_path": file_path,
+                                "diff_context": diff_context,
+                            }),
+                        });
+                    }
                 }
-            } else if let Some(file_hint) = extract_file_hint(trimmed) {
-                emissions.push(StreamEmission {
-                    stream: ViewStreamKind::Code,
-                    kind: "file_hint".to_owned(),
-                    message: format!("Detected file hint {}", file_hint),
-                    payload: json!({
-                        "terminal_id": terminal_id,
-                        "file_path": file_hint,
-                        "source_line": trimmed,
-                    }),
-                });
             }
         }
         if buffer.len() > 4096 {
@@ -88,6 +96,8 @@ impl RoomTelemetry {
     }
 
     pub fn pane_render_emissions(&mut self, report: &PaneRenderReport) -> Vec<StreamEmission> {
+        // Only track viewport hashes for pane_snapshot (used by review request).
+        // No viewport scanning — tool calls come from hooks or PTY parsing.
         let Some(pane_map) = report.all_pane_contents.values().next() else {
             return vec![];
         };
@@ -98,8 +108,9 @@ impl RoomTelemetry {
             if previous_hash == Some(viewport_hash) {
                 continue;
             }
+            // Write pane_snapshot to events (for review request viewport data)
             emissions.push(StreamEmission {
-                stream: ViewStreamKind::Code,
+                stream: ViewStreamKind::Events,
                 kind: "pane_snapshot".to_owned(),
                 message: format!(
                     "Pane {} viewport updated ({} lines)",
@@ -129,7 +140,11 @@ impl RoomTelemetry {
                     buffer.pop();
                 },
                 '\r' | '\n' => {
-                    if let Some(command) = detect_special_command(buffer.trim()) {
+                    let trimmed = buffer.trim().to_owned();
+                    if !trimmed.is_empty() {
+                        self.last_committed_inputs.insert(pane_id, trimmed.clone());
+                    }
+                    if let Some(command) = detect_special_command(&trimmed) {
                         commands.push(command);
                     }
                     buffer.clear();
@@ -155,10 +170,18 @@ impl RoomTelemetry {
 }
 
 fn pane_contents_payload(pane_id: PaneId, pane_contents: &PaneContents) -> serde_json::Value {
-    let preview: Vec<String> = pane_contents.viewport.iter().take(40).cloned().collect();
+    // Keep a tail snapshot across scrollback + viewport so structured blocks
+    // that scrolled above the visible window can still be parsed.
+    let max_lines = 240usize;
+    let mut snapshot: Vec<String> = Vec::new();
+    snapshot.extend(pane_contents.lines_above_viewport.iter().cloned());
+    snapshot.extend(pane_contents.viewport.iter().cloned());
+    let start = snapshot.len().saturating_sub(max_lines);
+    let snapshot_tail: Vec<String> = snapshot.into_iter().skip(start).collect();
     json!({
         "pane_id": pane_id.to_string(),
-        "viewport": preview,
+        "viewport": pane_contents.viewport.clone(),
+        "snapshot": snapshot_tail,
         "viewport_line_count": pane_contents.viewport.len(),
         "lines_above_viewport": pane_contents.lines_above_viewport.len(),
         "lines_below_viewport": pane_contents.lines_below_viewport.len(),
@@ -253,14 +276,126 @@ fn detect_special_command(line: &str) -> Option<AcpSpecialCommand> {
         "claude" | "codex" | "gemini" => Some(AcpSpecialCommand::LaunchProvider {
             provider: first.to_owned(),
         }),
-        "zellij" => match parts.next()? {
-            "claude" | "codex" | "gemini" | "reviewer" | "review" | "view" => {
-                Some(AcpSpecialCommand::EnsureRoom)
-            },
-            _ => None,
+        "reviewer" | "review" => Some(AcpSpecialCommand::PrefixWithZellij),
+        "view" => {
+            // "view code [id]" or "view events [id]"
+            let stream = parts.next().unwrap_or("events").to_owned();
+            if stream == "code" || stream == "events" {
+                let room_id = parts.next().map(|s| s.to_owned());
+                Some(AcpSpecialCommand::LaunchViewPane { stream, room_id })
+            } else {
+                None
+            }
+        },
+        "zellij" => {
+            let second = parts.next()?;
+            match second {
+                "claude" | "codex" | "gemini" | "reviewer" | "review" => {
+                    Some(AcpSpecialCommand::EnsureRoom)
+                },
+                "view" => {
+                    let stream = parts.next().unwrap_or("events").to_owned();
+                    if stream == "code" || stream == "events" {
+                        let room_id = parts.next().map(|s| s.to_owned());
+                        Some(AcpSpecialCommand::LaunchViewPane { stream, room_id })
+                    } else {
+                        None
+                    }
+                },
+                _ => None,
+            }
         },
         _ => None,
     }
+}
+
+fn extract_file_path_from_tool_value(value: &str) -> Option<String> {
+    // Try to extract file_path from tool call value like:
+    // file_path="/Users/bill/zellij/src/main.rs", ...
+    // or just a bare path like: /Users/bill/zellij/src/main.rs
+    for segment in value.split(',') {
+        let segment = segment.trim();
+        if let Some(rest) = segment
+            .strip_prefix("file_path=")
+            .or_else(|| segment.strip_prefix("file_path=\""))
+        {
+            let path = rest.trim_matches('"').trim();
+            if !path.is_empty() {
+                return Some(path.to_owned());
+            }
+        }
+    }
+    // Fallback: if the entire value looks like a file path
+    let trimmed = value.trim().trim_matches('"');
+    if !trimmed.is_empty() && !trimmed.contains(' ') && (trimmed.contains('/') || trimmed.contains('.')) {
+        return Some(trimmed.to_owned());
+    }
+    None
+}
+
+fn read_file_context_for_code_stream(file_path: &str) -> String {
+    let path = std::path::Path::new(file_path);
+    // Try absolute path first, then resolve relative to common locations
+    let resolved = if path.exists() && path.is_file() {
+        path.to_path_buf()
+    } else if let Ok(cwd) = std::env::current_dir() {
+        let candidate = cwd.join(file_path);
+        if candidate.exists() && candidate.is_file() {
+            candidate
+        } else {
+            // Try home dir
+            if let Ok(home) = std::env::var("HOME") {
+                let candidate = std::path::PathBuf::from(home).join(file_path);
+                if candidate.exists() && candidate.is_file() {
+                    candidate
+                } else {
+                    return String::new();
+                }
+            } else {
+                return String::new();
+            }
+        }
+    } else {
+        return String::new();
+    };
+    let path = &resolved;
+    if !path.exists() || !path.is_file() {
+        return String::new();
+    }
+    match std::fs::read_to_string(path) {
+        Ok(content) => {
+            let lines: Vec<&str> = content.lines().collect();
+            let total = lines.len();
+            let mut result = Vec::new();
+            result.push(format!("@@ {}: {} ({} lines) @@", file_path, path.display(), total));
+            let show_lines = if total <= 60 { total } else { 40 };
+            for (i, line) in lines.iter().take(show_lines).enumerate() {
+                result.push(format!("+{:4} | {}", i + 1, line));
+            }
+            if total > show_lines {
+                result.push(format!("      | ... +{} more lines ...", total - show_lines));
+            }
+            result.join("\n")
+        },
+        Err(_) => String::new(),
+    }
+}
+
+fn detect_wrote_result(line: &str) -> Option<(String, usize)> {
+    // Match: "Wrote 187 lines to code-review-test/task_queue.py"
+    // or:    "⎿  Wrote 109 lines to code-review-test/cache_manager.py"
+    let rest = line
+        .find("Wrote ")
+        .map(|i| &line[i + "Wrote ".len()..])?;
+    let parts: Vec<&str> = rest.splitn(3, ' ').collect();
+    if parts.len() >= 3 && parts[1] == "lines" {
+        let count = parts[0].parse::<usize>().ok()?;
+        let path = parts[2].strip_prefix("to ").unwrap_or(parts[2]).trim();
+        if !path.is_empty() && path.contains('/') {
+            return Some((path.to_owned(), count));
+        }
+    }
+    None
 }
 
 fn extract_file_hint(line: &str) -> Option<String> {
@@ -293,19 +428,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn extracts_tool_calls_and_file_hints_from_terminal_lines() {
+    fn extracts_tool_calls_and_code_changes_from_terminal_lines() {
         let mut telemetry = RoomTelemetry::default();
         let emissions = telemetry.ingest_pty_bytes(
             7,
             b"\xe2\x8f\xba Write(src/main.rs)\n\xe2\x8f\xba Bash(cargo test -p zellij-server)\n",
         );
 
+        // Write(src/main.rs) -> tool_call + code_change
+        // Bash(cargo test ...) -> tool_call
         assert_eq!(emissions.len(), 3);
         assert_eq!(emissions[0].kind, "tool_call");
-        assert_eq!(emissions[1].kind, "file_hint");
+        assert_eq!(emissions[1].kind, "code_change");
+        assert_eq!(emissions[1].stream, ViewStreamKind::Code);
         assert_eq!(emissions[2].kind, "tool_call");
         assert_eq!(emissions[2].stream, ViewStreamKind::Events);
-        assert!(emissions[2].payload.get("file_path").is_none());
     }
 
     #[test]
@@ -328,7 +465,10 @@ mod tests {
         let first = telemetry.pane_render_emissions(&report);
         let second = telemetry.pane_render_emissions(&report);
 
+        // First render: emits pane_snapshot
         assert_eq!(first.len(), 1);
+        assert_eq!(first[0].kind, "pane_snapshot");
+        // Second render: same viewport, deduped
         assert!(second.is_empty());
     }
 
@@ -348,8 +488,7 @@ mod tests {
     #[test]
     fn detects_plain_provider_launches_from_user_input() {
         let mut telemetry = RoomTelemetry::default();
-        let commands =
-            telemetry.ingest_input_bytes(PaneId::Terminal(1), b"claude --model opus\r");
+        let commands = telemetry.ingest_input_bytes(PaneId::Terminal(1), b"claude --model opus\r");
         assert_eq!(
             commands,
             vec![AcpSpecialCommand::LaunchProvider {
@@ -364,6 +503,13 @@ mod tests {
         let commands =
             telemetry.ingest_input_bytes(PaneId::Terminal(1), b"zellij reviewer 123456\n");
         assert_eq!(commands, vec![AcpSpecialCommand::EnsureRoom]);
+    }
+
+    #[test]
+    fn detects_bare_acp_commands_for_zellij_prefixing() {
+        let mut telemetry = RoomTelemetry::default();
+        let commands = telemetry.ingest_input_bytes(PaneId::Terminal(1), b"review request 123\n");
+        assert_eq!(commands, vec![AcpSpecialCommand::PrefixWithZellij]);
     }
 
     #[test]

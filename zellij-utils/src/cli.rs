@@ -164,6 +164,22 @@ pub struct RoomCli {
     /// Shared room ID. If omitted, Zellij creates one and prints it.
     #[clap(value_parser = validate_session)]
     pub shared_id: Option<String>,
+
+    /// Desired reviewer pane count for this room workspace
+    #[clap(long, value_parser)]
+    pub reviewer_count: Option<usize>,
+
+    /// Extra reviewer guidance text (Chinese/English both supported)
+    #[clap(long, value_parser, conflicts_with = "reviewer-prompt-file")]
+    pub reviewer_prompt: Option<String>,
+
+    /// Load extra reviewer guidance text from a file
+    #[clap(long, value_parser, conflicts_with = "reviewer-prompt")]
+    pub reviewer_prompt_file: Option<PathBuf>,
+
+    /// Extra provider launch args persisted in room workspace (eg: resume session args)
+    #[clap(long, value_parser)]
+    pub provider_args: Option<String>,
 }
 
 #[derive(Debug, Clone, Subcommand, Serialize, Deserialize)]
@@ -180,6 +196,24 @@ pub enum ReviewCli {
     Request(RoomCli),
     /// Record reviewer feedback from a structured ACP response block
     Feedback(ReviewFeedbackCli),
+    /// Enable automatic reviewer loop and start a background worker
+    #[clap(name = "auto-start")]
+    AutoStart(RoomCli),
+    /// Disable automatic reviewer loop
+    #[clap(name = "auto-stop")]
+    AutoStop(RoomCli),
+    /// Enable auto-send: reviewer feedback is injected to driver automatically
+    #[clap(name = "auto-send-on")]
+    AutoSendOn(RoomCli),
+    /// Disable auto-send: reviewer feedback is recorded but not auto-injected
+    #[clap(name = "auto-send-off")]
+    AutoSendOff(RoomCli),
+    /// Show automatic reviewer loop status
+    #[clap(name = "auto-status")]
+    AutoStatus(RoomCli),
+    /// Internal background worker for automatic reviewer loop
+    #[clap(name = "auto-worker", hide = true)]
+    AutoWorker(RoomCli),
 }
 
 #[derive(Debug, Clone, Args, Serialize, Deserialize)]

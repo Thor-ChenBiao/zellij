@@ -5,3 +5,6 @@ target/
 .idea
 .DS_Store
 /assets/man/zellij.1
+
+# ACP build artifacts
+zellij-utils/assets/plugins/acp-bar.wasm

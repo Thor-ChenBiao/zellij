@@ -4654,6 +4654,20 @@ impl Screen {
         if self.session_name.is_empty() {
             return;
         }
+        // pane_snapshot: write to jsonl only (for review request data), skip text log
+        // to avoid flooding view events with viewport noise
+        if emission.kind == "pane_snapshot" {
+            if let Ok(true) = zellij_utils::agent_control_plane::room_exists_check(&self.session_name) {
+                let _ = zellij_utils::agent_control_plane::append_stream_jsonl_only(
+                    emission.stream,
+                    &self.session_name,
+                    &emission.kind,
+                    emission.message,
+                    emission.payload,
+                );
+            }
+            return;
+        }
         if let Err(err) = append_session_stream_event(
             emission.stream,
             &self.session_name,
@@ -4786,23 +4800,27 @@ impl Screen {
         client_id: ClientId,
         pane_id: PaneId,
         raw_bytes: &[u8],
-    ) {
+    ) -> Option<Vec<u8>> {
         if !matches!(pane_id, PaneId::Terminal(_)) || self.session_name.is_empty() {
-            return;
+            return None;
         }
         let commands = self
             .room_telemetry
             .ingest_input_bytes(pane_id.into(), raw_bytes);
+        let mut rewritten_bytes = None;
         for command in commands {
-            self.handle_acp_special_command(client_id, pane_id, command);
+            if let Some(bytes) = self.handle_acp_special_command(client_id, pane_id, command) {
+                rewritten_bytes = Some(bytes);
+            }
         }
+        rewritten_bytes
     }
     fn handle_acp_special_command(
         &mut self,
         client_id: ClientId,
         pane_id: PaneId,
         command: AcpSpecialCommand,
-    ) {
+    ) -> Option<Vec<u8>> {
         let shared_id = self.session_name.clone();
         let pane_id_string = pane_id.to_string();
         let room_was_missing = !room_exists(&shared_id);
@@ -4811,7 +4829,7 @@ impl Screen {
                 "failed to initialize ACP room files for session {}: {}",
                 shared_id, err
             );
-            return;
+            return None;
         }
         if room_was_missing {
             let _ = append_session_stream_event(
@@ -4829,13 +4847,43 @@ impl Screen {
         let bound_endpoint = bound_endpoint_for_pane(&shared_id, &pane_id_string)
             .ok()
             .flatten();
+        // Don't intercept commands in agent panes (Claude Code, Codex, etc.)
+        // Only intercept in plain shell panes (no bound endpoint, or role != driver/reviewer)
+        let is_agent_pane = bound_endpoint
+            .as_ref()
+            .map(|ep| ep.role == "driver" || ep.role == "reviewer")
+            .unwrap_or(false);
+        if is_agent_pane {
+            match &command {
+                AcpSpecialCommand::EnsureRoom => {
+                    self.send_acp_room_state(client_id, &shared_id, None, None);
+                    return None;
+                },
+                _ => return None, // Don't intercept in agent panes
+            }
+        }
         match command {
             AcpSpecialCommand::EnsureRoom => {
                 self.send_acp_room_state(client_id, &shared_id, None, None);
+                None
+            },
+            AcpSpecialCommand::PrefixWithZellij => {
+                self.send_acp_room_state(client_id, &shared_id, None, None);
+                // Clear current input, prepend "zellij " and re-type the original command
+                let original_input = self.room_telemetry.last_committed_input(pane_id.into()).unwrap_or_default();
+                let cmd = format!("\x15zellij {}\r", original_input);
+                Some(cmd.into_bytes())
+            },
+            AcpSpecialCommand::LaunchViewPane { stream, room_id } => {
+                let room_id = room_id.unwrap_or_else(|| shared_id.clone());
+                // Rewrite user input: clear line (Ctrl-U), type the correct command
+                let cmd = format!("\x15zellij view {} {}\r", stream, room_id);
+                log::info!("ACP: intercepted view command, rewriting to: zellij view {} {}", stream, room_id);
+                Some(cmd.into_bytes())
             },
             AcpSpecialCommand::LaunchProvider { provider } => {
                 if bound_endpoint.is_some() {
-                    return;
+                    return None;
                 }
                 let cwd = std::env::current_dir()
                     .unwrap_or_else(|_| PathBuf::from("."))
@@ -4880,6 +4928,7 @@ impl Screen {
                         );
                     },
                 }
+                None
             },
         }
     }
@@ -5572,23 +5621,18 @@ pub(crate) fn screen_thread_main(
                 }
                 let mut state_changed = false;
                 let client_input_mode = screen.get_client_input_mode(client_id);
+                let mut raw_bytes = raw_bytes;
                 if let Some(active_pane_id) = screen.get_active_pane_id(&client_id) {
-                    screen.maybe_capture_acp_special_commands(
+                    if let Some(rewritten_bytes) = screen.maybe_capture_acp_special_commands(
                         client_id,
                         active_pane_id,
                         &raw_bytes,
-                    );
+                    ) {
+                        raw_bytes = rewritten_bytes;
+                    }
                 }
-                screen.append_room_input_event(
-                    "write_character",
-                    None,
-                    Some(client_id),
-                    &raw_bytes,
-                    json!({
-                        "input_mode": client_input_mode.map(|mode| format!("{:?}", mode)),
-                        "kitty_keyboard": is_kitty_keyboard_protocol,
-                    }),
-                );
+                // Don't write character-level input to events stream.
+                // Tool calls come from provider hooks, not terminal keystroke capture.
                 match client_input_mode {
                     Some(InputMode::RenameTab) => {
                         if !(raw_bytes == BRACKETED_PASTE_BEGIN || raw_bytes == BRACKETED_PASTE_END)
@@ -8290,8 +8334,13 @@ pub(crate) fn screen_thread_main(
                 screen.render(None)?;
             },
             ScreenInstruction::WriteToPaneId(bytes, pane_id, _completion) => {
+                let mut bytes = bytes;
                 if let Some(client_id) = screen.get_first_client_id() {
-                    screen.maybe_capture_acp_special_commands(client_id, pane_id, &bytes);
+                    if let Some(rewritten_bytes) =
+                        screen.maybe_capture_acp_special_commands(client_id, pane_id, &bytes)
+                    {
+                        bytes = rewritten_bytes;
+                    }
                 }
                 screen.append_room_input_event(
                     "write_to_pane_id",
@@ -8311,13 +8360,16 @@ pub(crate) fn screen_thread_main(
                 screen.render(None)?;
             },
             ScreenInstruction::Paste(bytes, pane_id, client_id, _completion) => {
+                let mut bytes = bytes;
                 if pane_id.is_none() {
                     if let Some(active_pane_id) = screen.get_active_pane_id(&client_id) {
-                        screen.maybe_capture_acp_special_commands(
+                        if let Some(rewritten_bytes) = screen.maybe_capture_acp_special_commands(
                             client_id,
                             active_pane_id,
                             &bytes,
-                        );
+                        ) {
+                            bytes = rewritten_bytes;
+                        }
                     }
                 }
                 screen.append_room_input_event(
@@ -8370,8 +8422,13 @@ pub(crate) fn screen_thread_main(
                 pane_id,
                 _completion,
             ) => {
+                let mut bytes = bytes;
                 if let Some(client_id) = screen.get_first_client_id() {
-                    screen.maybe_capture_acp_special_commands(client_id, pane_id, &bytes);
+                    if let Some(rewritten_bytes) =
+                        screen.maybe_capture_acp_special_commands(client_id, pane_id, &bytes)
+                    {
+                        bytes = rewritten_bytes;
+                    }
                 }
                 screen.append_room_input_event(
                     "write_key_to_pane_id",
