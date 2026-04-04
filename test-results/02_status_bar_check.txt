@@ -1,0 +1,6 @@
+$ cargo check -p status-bar
+
+    Checking status-bar v0.1.0 (/Users/chenbiao/zellij/default-plugins/status-bar)
+    Finished `dev` profile [unoptimized + debuginfo] target(s)
+
+Result: PASS - no errors

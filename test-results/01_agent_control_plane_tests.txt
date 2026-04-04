@@ -1,0 +1,8 @@
+$ cargo test -p zellij-server -- agent_control_plane
+
+running 3 tests
+test agent_control_plane::tests::trims_long_multibyte_partial_lines_without_panicking ... ok
+test agent_control_plane::tests::extracts_tool_calls_and_file_hints_from_terminal_lines ... ok
+test agent_control_plane::tests::deduplicates_identical_viewport_snapshots ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 1101 filtered out; finished in 0.01s
