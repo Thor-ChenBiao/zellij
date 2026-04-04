@@ -1,11 +1,18 @@
 use crate::agent_control_plane::{
     append_stream_event, follow_stream, list_room_endpoints, prepare_review_request,
-    record_review_feedback, register_participant, room_metadata, AgentPersona, EndpointMetadata,
-    ViewStreamKind,
+    record_review_feedback, register_participant, room_metadata, update_endpoint_pane_binding,
+    AgentPersona, EndpointMetadata, ViewStreamKind,
 };
 use dialoguer::Confirm;
 use std::net::IpAddr;
-use std::{fs::File, io::prelude::*, path::PathBuf, process, time::Duration};
+use std::{
+    collections::HashSet,
+    fs::File,
+    io::prelude::*,
+    path::{Path, PathBuf},
+    process, thread,
+    time::Duration,
+};
 
 #[cfg(feature = "web_server_capability")]
 use isahc::{config::RedirectPolicy, prelude::*, HttpClient, Request};
@@ -246,13 +253,57 @@ fn attach_create_command(session_name: String) -> Command {
     })
 }
 
-fn provider_command_for_persona(persona: AgentPersona) -> Option<&'static str> {
-    match persona {
-        AgentPersona::Claude => Some("claude"),
-        AgentPersona::Codex => Some("codex"),
-        AgentPersona::Gemini => Some("gemini"),
-        AgentPersona::Reviewer => None,
+fn terminal_provider_command(provider: &str) -> Option<&'static str> {
+    match provider {
+        "claude" => Some("claude"),
+        "codex" => Some("codex"),
+        "gemini" => Some("gemini"),
+        _ => None,
     }
+}
+
+fn latest_driver_endpoint(endpoints: &[EndpointMetadata]) -> Option<&EndpointMetadata> {
+    endpoints.iter().rev().find(|endpoint| {
+        endpoint.role == "driver" && terminal_provider_command(&endpoint.provider).is_some()
+    })
+}
+
+fn reviewer_provider_context(
+    endpoints: &[EndpointMetadata],
+    fallback_cwd: &Path,
+) -> (String, PathBuf) {
+    latest_driver_endpoint(endpoints)
+        .and_then(|endpoint| {
+            terminal_provider_command(&endpoint.provider)
+                .map(|provider_command| (provider_command.to_owned(), PathBuf::from(&endpoint.cwd)))
+        })
+        .unwrap_or_else(|| ("claude".to_owned(), fallback_cwd.to_path_buf()))
+}
+
+fn provider_context_for_persona(
+    persona: AgentPersona,
+    endpoints: &[EndpointMetadata],
+    fallback_cwd: &Path,
+) -> (Option<String>, PathBuf) {
+    match persona {
+        AgentPersona::Claude => (Some("claude".to_owned()), fallback_cwd.to_path_buf()),
+        AgentPersona::Codex => (Some("codex".to_owned()), fallback_cwd.to_path_buf()),
+        AgentPersona::Gemini => (Some("gemini".to_owned()), fallback_cwd.to_path_buf()),
+        AgentPersona::Reviewer => {
+            let (provider_command, cwd) = reviewer_provider_context(endpoints, fallback_cwd);
+            (Some(provider_command), cwd)
+        },
+    }
+}
+
+fn reviewer_bootstrap_message(endpoint: &EndpointMetadata) -> Option<String> {
+    let bootstrap_prompt = endpoint.reviewer_bootstrap_prompt.as_deref()?;
+    let review_message_template = endpoint.review_message_template.as_deref()?;
+    Some(format!(
+        "{bootstrap_prompt}\n\nIdentity:\n- room_id: {room_id}\n- reviewer_endpoint: {endpoint_id}\n- role: reviewer\n- review_target_role: driver\n\nWhen you send structured feedback back to the driver, use this exact protocol:\n[ACP_REVIEW_RESPONSE_V1]\nroom_id: {room_id}\nrequest_id: <request_id>\nsource_endpoint: {endpoint_id}\ntarget_role: driver\nseverity: <low|medium|high>\nconfidence: <low|medium|high>\nshould_send: true\nsummary: <one-line summary>\n\nfindings:\n- <finding>\n\nactions:\n- <action>\n\nnotes:\n- <optional notes>\n[/ACP_REVIEW_RESPONSE_V1]\n\nHuman-readable review template:\n{review_message_template}\n\nReply once with READY as the reviewer, then wait for review requests.",
+        room_id = endpoint.shared_id,
+        endpoint_id = endpoint.endpoint_id,
+    ))
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -343,39 +394,77 @@ fn spawn_provider_pane(
     provider_command: &str,
     cwd: PathBuf,
     pane_name: Option<String>,
+) -> Result<String, String> {
+    let current_exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let mut command = process::Command::new(current_exe);
+    command
+        .arg("--session")
+        .arg(session_name)
+        .arg("action")
+        .arg("new-pane")
+        .arg("--cwd")
+        .arg(&cwd);
+    if let Some(pane_name) = pane_name {
+        command.arg("--name").arg(pane_name);
+    }
+    command.arg("--").arg(provider_command);
+    let output = command.output().map_err(|e| e.to_string())?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        return Err(if stderr.is_empty() {
+            format!("new-pane failed with status {}", output.status)
+        } else {
+            stderr
+        });
+    }
+    let pane_id = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if pane_id.is_empty() {
+        Err(format!(
+            "new-pane did not return a pane id for session '{}'",
+            session_name
+        ))
+    } else {
+        Ok(pane_id)
+    }
+}
+
+fn inject_reviewer_bootstrap_into_pane(
+    session_name: &str,
+    pane_id: &str,
+    endpoint: &EndpointMetadata,
 ) -> Result<(), String> {
-    dispatch_cli_action_to_session(
-        CliAction::NewPane {
-            direction: None,
-            command: vec![provider_command.to_owned()],
-            plugin: None,
-            cwd: Some(cwd),
-            floating: false,
-            in_place: false,
-            close_replaced_pane: false,
-            name: pane_name,
-            close_on_exit: false,
-            start_suspended: false,
-            configuration: None,
-            skip_plugin_cache: false,
-            x: None,
-            y: None,
-            width: None,
-            height: None,
-            pinned: None,
-            stacked: false,
-            blocking: false,
-            block_until_exit_success: false,
-            block_until_exit_failure: false,
-            block_until_exit: false,
-            unblock_condition: None,
-            near_current_pane: false,
-            borderless: Some(false),
-            tab_id: None,
-        },
+    let Some(bootstrap_message) = reviewer_bootstrap_message(endpoint) else {
+        return Ok(());
+    };
+    thread::sleep(Duration::from_millis(250));
+    run_cli_action_in_session(
         session_name,
-        None,
-    )
+        CliAction::Paste {
+            chars: bootstrap_message,
+            pane_id: Some(pane_id.to_owned()),
+        },
+    )?;
+    run_cli_action_in_session(
+        session_name,
+        CliAction::SendKeys {
+            keys: vec!["Enter".to_owned()],
+            pane_id: Some(pane_id.to_owned()),
+        },
+    )?;
+    let _ = append_stream_event(
+        ViewStreamKind::Events,
+        &endpoint.shared_id,
+        "reviewer_bootstrap_injected",
+        Some(endpoint),
+        format!(
+            "Injected reviewer bootstrap into {} for {}",
+            pane_id, endpoint.endpoint_id
+        ),
+        json!({
+            "target_pane_id": pane_id,
+        }),
+    );
+    Ok(())
 }
 
 pub(crate) fn start_shared_room(
@@ -414,9 +503,8 @@ pub(crate) fn start_shared_room(
     );
     std::env::set_var("ZELLIJ_AGENT_PROVIDER", &participant.endpoint.provider);
     std::env::set_var("ZELLIJ_AGENT_ROLE", &participant.endpoint.role);
-    let room_role_counts = list_room_endpoints(&shared_id)
-        .map(|endpoints| count_room_roles(&endpoints))
-        .unwrap_or_default();
+    let room_endpoints = list_room_endpoints(&shared_id).unwrap_or_default();
+    let room_role_counts = count_room_roles(&room_endpoints);
 
     println!(
         "Shared room: {} ({})",
@@ -460,7 +548,8 @@ pub(crate) fn start_shared_room(
         );
     }
 
-    let provider_command = provider_command_for_persona(persona);
+    let (provider_command, provider_cwd) =
+        provider_context_for_persona(persona, &room_endpoints, &current_dir);
     let session_active = room_session_is_active(&shared_id);
 
     if participant.room_created || !session_active {
@@ -470,8 +559,8 @@ pub(crate) fn start_shared_room(
         opts.new_session_with_layout = None;
         opts.layout_string = Some(room_layout_string(
             &shared_id,
-            provider_command,
-            &current_dir,
+            provider_command.as_deref(),
+            &provider_cwd,
             &participant.endpoint,
             room_role_counts,
         ));
@@ -479,17 +568,43 @@ pub(crate) fn start_shared_room(
         return;
     }
 
-    if let Some(provider_command) = provider_command {
-        if let Err(e) = spawn_provider_pane(
+    if let Some(provider_command) = provider_command.as_deref() {
+        match spawn_provider_pane(
             &shared_id,
             provider_command,
-            current_dir.clone(),
+            provider_cwd.clone(),
             Some(participant.endpoint.label.clone()),
         ) {
-            eprintln!(
-                "Failed to start {} pane in shared room '{}': {}",
-                provider_command, shared_id, e
-            );
+            Ok(pane_id) => {
+                if let Err(e) = update_endpoint_pane_binding(
+                    &shared_id,
+                    &participant.endpoint.endpoint_id,
+                    &pane_id,
+                ) {
+                    eprintln!(
+                        "Failed to bind {} to {} in shared room '{}': {}",
+                        participant.endpoint.endpoint_id, pane_id, shared_id, e
+                    );
+                }
+                if persona == AgentPersona::Reviewer {
+                    if let Err(e) = inject_reviewer_bootstrap_into_pane(
+                        &shared_id,
+                        &pane_id,
+                        &participant.endpoint,
+                    ) {
+                        eprintln!(
+                            "Failed to inject reviewer bootstrap into '{}' in shared room '{}': {}",
+                            pane_id, shared_id, e
+                        );
+                    }
+                }
+            },
+            Err(e) => {
+                eprintln!(
+                    "Failed to start {} pane in shared room '{}': {}",
+                    provider_command, shared_id, e
+                );
+            },
         }
     }
 
@@ -676,8 +791,120 @@ fn inject_review_feedback_into_driver(
     Ok(())
 }
 
+fn resolve_live_bound_reviewer_panes(
+    session_name: &str,
+    shared_id: &str,
+) -> std::result::Result<Vec<(EndpointMetadata, String)>, String> {
+    let live_pane_ids: HashSet<String> = list_session_panes(session_name)?
+        .iter()
+        .filter(|entry| !entry.pane_info.is_plugin && !entry.pane_info.is_suppressed)
+        .map(|entry| format_terminal_pane_id(entry.pane_info.id, false))
+        .collect();
+    let endpoints = list_room_endpoints(shared_id).map_err(|e| e.to_string())?;
+    Ok(endpoints
+        .into_iter()
+        .filter(|endpoint| endpoint.role == "reviewer")
+        .filter_map(|endpoint| {
+            endpoint.bound_pane_id.clone().and_then(|pane_id| {
+                if live_pane_ids.contains(&pane_id) {
+                    Some((endpoint, pane_id))
+                } else {
+                    None
+                }
+            })
+        })
+        .collect())
+}
+
+fn backfill_driver_pane_binding_from_live_room(
+    session_name: &str,
+    shared_id: &str,
+) -> std::result::Result<(), String> {
+    let endpoints = list_room_endpoints(shared_id).map_err(|e| e.to_string())?;
+    let drivers: Vec<&EndpointMetadata> = endpoints
+        .iter()
+        .filter(|endpoint| endpoint.role == "driver")
+        .collect();
+    if drivers.len() != 1 {
+        return Ok(());
+    }
+    let driver_endpoint = drivers[0];
+    let non_driver_bound_pane_ids: HashSet<String> = endpoints
+        .iter()
+        .filter(|endpoint| endpoint.role != "driver")
+        .filter_map(|endpoint| endpoint.bound_pane_id.clone())
+        .collect();
+    let driver_candidate_panes: Vec<String> = list_session_panes(session_name)?
+        .iter()
+        .filter(|entry| !entry.pane_info.is_plugin && !entry.pane_info.is_suppressed)
+        .map(|entry| format_terminal_pane_id(entry.pane_info.id, false))
+        .filter(|pane_id| !non_driver_bound_pane_ids.contains(pane_id))
+        .collect();
+    if driver_candidate_panes.len() != 1 {
+        return Ok(());
+    }
+    let pane_id = &driver_candidate_panes[0];
+    if driver_endpoint.bound_pane_id.as_deref() == Some(pane_id) {
+        return Ok(());
+    }
+    update_endpoint_pane_binding(shared_id, &driver_endpoint.endpoint_id, pane_id)
+        .map_err(|e| e.to_string())?;
+    let _ = append_stream_event(
+        ViewStreamKind::Events,
+        shared_id,
+        "driver_pane_binding_backfilled",
+        Some(driver_endpoint),
+        format!(
+            "Backfilled driver pane binding for {} -> {}",
+            driver_endpoint.endpoint_id, pane_id
+        ),
+        json!({
+            "target_pane_id": pane_id,
+        }),
+    );
+    Ok(())
+}
+
+fn inject_review_request_into_reviewer(
+    shared_id: &str,
+    pane_id: &str,
+    endpoint: &EndpointMetadata,
+    request_id: &str,
+    request_text: &str,
+) -> std::result::Result<(), String> {
+    run_cli_action_in_session(
+        shared_id,
+        CliAction::Paste {
+            chars: request_text.to_owned(),
+            pane_id: Some(pane_id.to_owned()),
+        },
+    )?;
+    run_cli_action_in_session(
+        shared_id,
+        CliAction::SendKeys {
+            keys: vec!["Enter".to_owned()],
+            pane_id: Some(pane_id.to_owned()),
+        },
+    )?;
+    let _ = append_stream_event(
+        ViewStreamKind::Events,
+        shared_id,
+        "review_request_injected_to_reviewer",
+        Some(endpoint),
+        format!("Injected review request {} into {}", request_id, pane_id),
+        json!({
+            "request_id": request_id,
+            "target_pane_id": pane_id,
+        }),
+    );
+    Ok(())
+}
+
 pub(crate) fn prepare_room_review_request(shared_id: Option<String>) {
     let shared_id = resolve_shared_room_id(shared_id);
+    if room_session_is_active(&shared_id) {
+        let _ = backfill_driver_pane_binding_from_live_room(&shared_id, &shared_id);
+    }
     let persisted = prepare_review_request(&shared_id).unwrap_or_else(|e| {
         eprintln!(
             "Failed to prepare review request for shared room '{}': {}",
@@ -695,6 +922,83 @@ pub(crate) fn prepare_room_review_request(shared_id: Option<String>) {
     println!("{}", persisted.text);
     println!("Saved request JSON: {}", persisted.json_path.display());
     println!("Saved request text: {}", persisted.text_path.display());
+    if room_session_is_active(&shared_id) {
+        match resolve_live_bound_reviewer_panes(&shared_id, &shared_id) {
+            Ok(reviewer_targets) if reviewer_targets.is_empty() => {
+                let _ = append_stream_event(
+                    ViewStreamKind::Events,
+                    &shared_id,
+                    "review_request_waiting_for_reviewer_delivery",
+                    None,
+                    format!(
+                        "Review request {} is waiting for reviewer delivery",
+                        persisted.request.request_id
+                    ),
+                    json!({
+                        "request_id": persisted.request.request_id,
+                        "reason": "no_live_bound_reviewer_panes",
+                    }),
+                );
+                println!("No live reviewer panes were found. Request kept on disk.");
+            },
+            Ok(reviewer_targets) => {
+                for (endpoint, pane_id) in reviewer_targets {
+                    match inject_review_request_into_reviewer(
+                        &shared_id,
+                        &pane_id,
+                        &endpoint,
+                        &persisted.request.request_id,
+                        &persisted.text,
+                    ) {
+                        Ok(()) => println!(
+                            "Injected review request into reviewer {} ({})",
+                            endpoint.endpoint_id, pane_id
+                        ),
+                        Err(e) => {
+                            let _ = append_stream_event(
+                                ViewStreamKind::Events,
+                                &shared_id,
+                                "review_request_waiting_for_reviewer_delivery",
+                                Some(&endpoint),
+                                format!(
+                                    "Review request {} is waiting for reviewer delivery",
+                                    persisted.request.request_id
+                                ),
+                                json!({
+                                    "request_id": persisted.request.request_id,
+                                    "target_pane_id": pane_id,
+                                    "reason": "reviewer_injection_failed",
+                                    "error": e,
+                                }),
+                            );
+                            println!(
+                                "Could not inject request into reviewer {} ({}). Request kept on disk.",
+                                endpoint.endpoint_id, pane_id
+                            );
+                        },
+                    }
+                }
+            },
+            Err(e) => {
+                let _ = append_stream_event(
+                    ViewStreamKind::Events,
+                    &shared_id,
+                    "review_request_waiting_for_reviewer_delivery",
+                    None,
+                    format!(
+                        "Review request {} is waiting for reviewer delivery",
+                        persisted.request.request_id
+                    ),
+                    json!({
+                        "request_id": persisted.request.request_id,
+                        "reason": "reviewer_pane_query_failed",
+                        "error": e,
+                    }),
+                );
+                println!("Could not inspect reviewer panes yet. Request kept on disk.");
+            },
+        }
+    }
 }
 
 pub(crate) fn record_room_review_feedback(
@@ -1695,4 +1999,68 @@ pub fn get_config_options_from_cli_args(opts: &CliArgs) -> Result<Options, Strin
     Setup::from_cli_args(&opts)
         .map(|(_, _, config_options, _, _)| config_options)
         .map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_endpoint(provider: &str, role: &str, cwd: &str) -> EndpointMetadata {
+        EndpointMetadata {
+            endpoint_id: format!("{provider}-{role}"),
+            shared_id: "room-1".to_owned(),
+            session_name: "room-1".to_owned(),
+            provider: provider.to_owned(),
+            role: role.to_owned(),
+            label: format!("{provider} {role}"),
+            cwd: cwd.to_owned(),
+            pid: 42,
+            created_at: "2026-04-04T00:00:00+08:00".to_owned(),
+            bound_pane_id: None,
+            bound_pane_id_updated_at: None,
+            reviewer_bootstrap_prompt: None,
+            review_message_template: None,
+        }
+    }
+
+    #[test]
+    fn reviewer_provider_context_prefers_latest_driver_provider_and_cwd() {
+        let fallback = Path::new("/fallback");
+        let endpoints = vec![
+            sample_endpoint("claude", "driver", "/first"),
+            sample_endpoint("reviewer", "reviewer", "/ignore"),
+            sample_endpoint("codex", "driver", "/second"),
+        ];
+
+        let (provider_command, cwd) = reviewer_provider_context(&endpoints, fallback);
+
+        assert_eq!(provider_command, "codex");
+        assert_eq!(cwd, PathBuf::from("/second"));
+    }
+
+    #[test]
+    fn reviewer_provider_context_falls_back_to_claude_and_fallback_cwd() {
+        let fallback = Path::new("/fallback");
+        let endpoints = vec![sample_endpoint("reviewer", "reviewer", "/ignore")];
+
+        let (provider_command, cwd) = reviewer_provider_context(&endpoints, fallback);
+
+        assert_eq!(provider_command, "claude");
+        assert_eq!(cwd, PathBuf::from("/fallback"));
+    }
+
+    #[test]
+    fn reviewer_bootstrap_message_includes_structured_protocol_and_identity() {
+        let mut endpoint = sample_endpoint("reviewer", "reviewer", "/repo");
+        endpoint.endpoint_id = "reviewer-abcd1234".to_owned();
+        endpoint.reviewer_bootstrap_prompt = Some("bootstrap".to_owned());
+        endpoint.review_message_template = Some("[Review from reviewer]".to_owned());
+
+        let bootstrap_message = reviewer_bootstrap_message(&endpoint).unwrap();
+
+        assert!(bootstrap_message.contains("room_id: room-1"));
+        assert!(bootstrap_message.contains("source_endpoint: reviewer-abcd1234"));
+        assert!(bootstrap_message.contains("[ACP_REVIEW_RESPONSE_V1]"));
+        assert!(bootstrap_message.contains("[Review from reviewer]"));
+    }
 }

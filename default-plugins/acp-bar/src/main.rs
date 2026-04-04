@@ -112,10 +112,7 @@ impl ZellijPlugin for State {
 
         match background {
             RGB(r, g, b) => {
-                print!(
-                    "{}{}\u{1b}[48;2;{};{};{}m\u{1b}[0K",
-                    prefix, body, r, g, b
-                );
+                print!("{}{}\u{1b}[48;2;{};{};{}m\u{1b}[0K", prefix, body, r, g, b);
             },
             Fixed(color) => {
                 print!("{}{}\u{1b}[48;5;{}m\u{1b}[0K", prefix, body, color);

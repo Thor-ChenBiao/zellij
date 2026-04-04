@@ -523,12 +523,80 @@ fn event_target_pane_id(event: &StreamEvent) -> Option<String> {
         })
 }
 
-fn infer_target_pane_id(events: &[StreamEvent], code_events: &[StreamEvent]) -> Option<String> {
+fn is_driver_event(
+    event: &StreamEvent,
+    driver_endpoint: Option<&str>,
+    driver_pane_id: Option<&str>,
+) -> bool {
+    if let Some(driver_endpoint) = driver_endpoint {
+        if event.endpoint_id.as_deref() == Some(driver_endpoint) {
+            return true;
+        }
+    }
+    if let Some(driver_pane_id) = driver_pane_id {
+        if event_target_pane_id(event).as_deref() == Some(driver_pane_id) {
+            return true;
+        }
+    }
+    if driver_endpoint.is_none() && driver_pane_id.is_none() {
+        return event.role.as_deref() == Some(REVIEW_TARGET_ROLE);
+    }
+    false
+}
+
+fn infer_target_pane_id(
+    events: &[StreamEvent],
+    code_events: &[StreamEvent],
+    driver_endpoint: Option<&str>,
+    driver_pane_id: Option<&str>,
+) -> Option<String> {
+    if let Some(driver_pane_id) = driver_pane_id {
+        return Some(driver_pane_id.to_owned());
+    }
     code_events
         .iter()
         .rev()
+        .filter(|event| is_driver_event(event, driver_endpoint, driver_pane_id))
         .find_map(event_target_pane_id)
-        .or_else(|| events.iter().rev().find_map(event_target_pane_id))
+        .or_else(|| {
+            events
+                .iter()
+                .rev()
+                .filter(|event| is_driver_event(event, driver_endpoint, driver_pane_id))
+                .find_map(event_target_pane_id)
+        })
+        .or_else(|| {
+            code_events
+                .iter()
+                .rev()
+                .find_map(event_target_pane_id)
+                .or_else(|| events.iter().rev().find_map(event_target_pane_id))
+        })
+}
+
+fn synthesize_recent_code_snapshot_for_driver(
+    code_events: &[StreamEvent],
+    driver_endpoint: Option<&str>,
+    driver_pane_id: Option<&str>,
+) -> Vec<String> {
+    code_events
+        .iter()
+        .rev()
+        .filter(|event| is_driver_event(event, driver_endpoint, driver_pane_id))
+        .find_map(|event| {
+            event
+                .payload
+                .get("viewport")
+                .and_then(|viewport| viewport.as_array())
+                .map(|viewport| {
+                    viewport
+                        .iter()
+                        .filter_map(|line| line.as_str().map(|line| line.to_owned()))
+                        .take(12)
+                        .collect::<Vec<_>>()
+                })
+        })
+        .unwrap_or_else(|| synthesize_recent_code_snapshot(code_events))
 }
 
 fn render_list_section(title: &str, values: &[String]) -> String {
@@ -599,17 +667,22 @@ fn prepare_review_request_at(
 ) -> io::Result<PersistedReviewRequest> {
     let _ = room_metadata_at(root, shared_id)?;
     let endpoints = list_room_endpoints_at(root, shared_id)?;
-    let driver_endpoint = endpoints
+    let driver_endpoint_metadata = endpoints
         .iter()
         .rev()
-        .find(|endpoint| endpoint.role == REVIEW_TARGET_ROLE)
-        .map(|endpoint| endpoint.endpoint_id.clone());
+        .find(|endpoint| endpoint.role == REVIEW_TARGET_ROLE);
+    let driver_endpoint = driver_endpoint_metadata.map(|endpoint| endpoint.endpoint_id.clone());
+    let driver_pane_id =
+        driver_endpoint_metadata.and_then(|endpoint| endpoint.bound_pane_id.clone());
     let events = read_stream_events_at(root, shared_id, ViewStreamKind::Events)?;
     let code_events = read_stream_events_at(root, shared_id, ViewStreamKind::Code)?;
 
     let mut changed_files = vec![];
     let mut changed_files_seen = HashSet::new();
     for event in &code_events {
+        if !is_driver_event(event, driver_endpoint.as_deref(), driver_pane_id.as_deref()) {
+            continue;
+        }
         if let Some(file_path) = event.payload.get("file_path").and_then(|v| v.as_str()) {
             push_unique(
                 &mut changed_files,
@@ -622,6 +695,9 @@ fn prepare_review_request_at(
     let mut last_commands = vec![];
     let mut last_commands_seen = HashSet::new();
     for event in events.iter().rev() {
+        if !is_driver_event(event, driver_endpoint.as_deref(), driver_pane_id.as_deref()) {
+            continue;
+        }
         if event.kind == "tool_call"
             && event
                 .payload
@@ -648,6 +724,9 @@ fn prepare_review_request_at(
         .iter()
         .rev()
         .filter(|event| {
+            is_driver_event(event, driver_endpoint.as_deref(), driver_pane_id.as_deref())
+        })
+        .filter(|event| {
             matches!(
                 event.kind.as_str(),
                 "tool_call"
@@ -667,8 +746,13 @@ fn prepare_review_request_at(
         schema_version: REVIEW_SCHEMA_VERSION,
         room_id: shared_id.to_owned(),
         request_id: next_review_request_id(root, shared_id),
-        driver_endpoint,
-        target_pane_id: infer_target_pane_id(&events, &code_events),
+        driver_endpoint: driver_endpoint.clone(),
+        target_pane_id: infer_target_pane_id(
+            &events,
+            &code_events,
+            driver_endpoint.as_deref(),
+            driver_pane_id.as_deref(),
+        ),
         target_role: REVIEW_TARGET_ROLE.to_owned(),
         mode: "approval".to_owned(),
         reason: reason
@@ -677,7 +761,11 @@ fn prepare_review_request_at(
         changed_files,
         last_commands,
         recent_output,
-        recent_code_snapshot: synthesize_recent_code_snapshot(&code_events),
+        recent_code_snapshot: synthesize_recent_code_snapshot_for_driver(
+            &code_events,
+            driver_endpoint.as_deref(),
+            driver_pane_id.as_deref(),
+        ),
         task: "Review 最新的 driver 活动。只返回一个 ACP_REVIEW_RESPONSE_V1 block。".to_owned(),
         created_at: now_string(),
     };
@@ -971,7 +1059,7 @@ fn resolve_feedback_target_pane_id(
     }
     let events = read_stream_events_at(root, shared_id, ViewStreamKind::Events)?;
     let code_events = read_stream_events_at(root, shared_id, ViewStreamKind::Code)?;
-    Ok(infer_target_pane_id(&events, &code_events))
+    Ok(infer_target_pane_id(&events, &code_events, None, None))
 }
 
 fn record_review_feedback_at(
@@ -1145,6 +1233,14 @@ pub(crate) fn list_room_endpoints(shared_id: &str) -> io::Result<Vec<EndpointMet
     }
     endpoints.sort_by(|a, b| a.created_at.cmp(&b.created_at));
     Ok(endpoints)
+}
+
+pub(crate) fn update_endpoint_pane_binding(
+    shared_id: &str,
+    endpoint_id: &str,
+    pane_id: &str,
+) -> io::Result<()> {
+    update_endpoint_pane_binding_at(&room_id_root(), shared_id, endpoint_id, pane_id)
 }
 
 pub(crate) fn ensure_room(shared_id: &str) -> io::Result<bool> {
@@ -1330,6 +1426,114 @@ mod tests {
         assert!(persisted.text.contains("[ACP_REVIEW_REQUEST_BEGIN]"));
         assert!(persisted.json_path.exists());
         assert!(persisted.text_path.exists());
+    }
+
+    #[test]
+    fn prepares_review_request_from_driver_events_only_when_reviewer_is_present() {
+        let temp = tempdir().unwrap();
+        let shared_id = "review-room-mixed";
+        let driver = register_participant_at(
+            temp.path(),
+            shared_id,
+            AgentPersona::Claude,
+            Path::new("/tmp/repo"),
+        )
+        .unwrap();
+        let reviewer = register_participant_at(
+            temp.path(),
+            shared_id,
+            AgentPersona::Reviewer,
+            Path::new("/tmp/repo"),
+        )
+        .unwrap();
+
+        append_stream_event_at(
+            temp.path(),
+            ViewStreamKind::Events,
+            shared_id,
+            "tool_call",
+            Some(&driver.endpoint),
+            "Bash(cargo test -p zellij-server)".to_owned(),
+            json!({
+                "tool": "Bash",
+                "value": "cargo test -p zellij-server",
+                "pane_id": "terminal_1",
+            }),
+        )
+        .unwrap();
+        append_stream_event_at(
+            temp.path(),
+            ViewStreamKind::Code,
+            shared_id,
+            "file_hint",
+            Some(&driver.endpoint),
+            "Detected file hint src/main.rs".to_owned(),
+            json!({
+                "file_path": "src/main.rs",
+                "pane_id": "terminal_1",
+            }),
+        )
+        .unwrap();
+        append_stream_event_at(
+            temp.path(),
+            ViewStreamKind::Code,
+            shared_id,
+            "pane_snapshot",
+            Some(&driver.endpoint),
+            "Pane terminal_1 viewport updated".to_owned(),
+            json!({
+                "pane_id": "terminal_1",
+                "viewport": ["driver line 1", "driver line 2"],
+            }),
+        )
+        .unwrap();
+        append_stream_event_at(
+            temp.path(),
+            ViewStreamKind::Events,
+            shared_id,
+            "paste",
+            Some(&reviewer.endpoint),
+            "Input reviewer bootstrap -> terminal_9".to_owned(),
+            json!({
+                "pane_id": "terminal_9",
+            }),
+        )
+        .unwrap();
+        append_stream_event_at(
+            temp.path(),
+            ViewStreamKind::Code,
+            shared_id,
+            "pane_snapshot",
+            Some(&reviewer.endpoint),
+            "Pane terminal_9 viewport updated".to_owned(),
+            json!({
+                "pane_id": "terminal_9",
+                "viewport": ["reviewer line 1", "reviewer line 2"],
+            }),
+        )
+        .unwrap();
+
+        let persisted =
+            prepare_review_request_at(temp.path(), shared_id, Some("driver_turn_closed")).unwrap();
+
+        assert_eq!(
+            persisted.request.target_pane_id.as_deref(),
+            Some("terminal_1")
+        );
+        assert_eq!(persisted.request.changed_files, vec!["src/main.rs"]);
+        assert_eq!(
+            persisted.request.last_commands,
+            vec!["cargo test -p zellij-server"]
+        );
+        assert_eq!(
+            persisted.request.recent_code_snapshot,
+            vec!["driver line 1".to_owned(), "driver line 2".to_owned()]
+        );
+        assert!(persisted
+            .request
+            .recent_output
+            .iter()
+            .all(|line| !line.contains("reviewer bootstrap")));
     }
 
     #[test]
