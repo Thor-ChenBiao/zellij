@@ -1284,7 +1284,6 @@ pub(crate) fn update_endpoint_pane_binding(
     update_endpoint_pane_binding_at(&room_id_root(), shared_id, endpoint_id, pane_id)
 }
 
-#[allow(dead_code)]
 pub(crate) fn ensure_room(shared_id: &str) -> io::Result<bool> {
     ensure_room_files(&room_id_root(), shared_id, shared_id)
 }
@@ -1465,14 +1464,14 @@ except:
 
 # Write to events stream
 echo "$NOW | $PROVIDER | $ROLE | tool_call | $TOOL" >> "$ROOM_DIR/events.log"
-python3 -c "
-import json, sys
+ACP_NOW="$NOW" ACP_ROOM="$ROOM_ID" ACP_EP="$ENDPOINT" ACP_PROV="$PROVIDER" ACP_ROLE="$ROLE" ACP_TOOL="$TOOL" python3 -c "
+import json, os
 event = {
-    'time': '$NOW', 'stream': 'events', 'kind': 'tool_call',
-    'shared_id': '$ROOM_ID', 'endpoint_id': '$ENDPOINT',
-    'provider': '$PROVIDER', 'role': '$ROLE',
-    'message': '$TOOL',
-    'payload': {'tool': '$TOOL', 'source': 'provider_hook'}
+    'time': os.environ['ACP_NOW'], 'stream': 'events', 'kind': 'tool_call',
+    'shared_id': os.environ['ACP_ROOM'], 'endpoint_id': os.environ['ACP_EP'],
+    'provider': os.environ['ACP_PROV'], 'role': os.environ['ACP_ROLE'],
+    'message': os.environ['ACP_TOOL'],
+    'payload': {'tool': os.environ['ACP_TOOL'], 'source': 'provider_hook'}
 }
 print(json.dumps(event))
 " >> "$ROOM_DIR/events.jsonl" 2>/dev/null
@@ -1518,14 +1517,14 @@ case "$TOOL" in
             else
                 cat "$DISPLAY_PATH" >> "$ROOM_DIR/code.log"
             fi
-            python3 -c "
-import json
+            ACP_NOW="$NOW" ACP_ROOM="$ROOM_ID" ACP_EP="$ENDPOINT" ACP_PROV="$PROVIDER" ACP_ROLE="$ROLE" ACP_TOOL="$TOOL" ACP_FPATH="$FILE_PATH" python3 -c "
+import json, os
 event = {
-    'time': '$NOW', 'stream': 'code', 'kind': 'code_change',
-    'shared_id': '$ROOM_ID', 'endpoint_id': '$ENDPOINT',
-    'provider': '$PROVIDER', 'role': '$ROLE',
-    'message': '$TOOL: $FILE_PATH',
-    'payload': {'tool': '$TOOL', 'file_path': '$FILE_PATH', 'source': 'provider_hook'}
+    'time': os.environ['ACP_NOW'], 'stream': 'code', 'kind': 'code_change',
+    'shared_id': os.environ['ACP_ROOM'], 'endpoint_id': os.environ['ACP_EP'],
+    'provider': os.environ['ACP_PROV'], 'role': os.environ['ACP_ROLE'],
+    'message': os.environ['ACP_TOOL'] + ': ' + os.environ['ACP_FPATH'],
+    'payload': {'tool': os.environ['ACP_TOOL'], 'file_path': os.environ['ACP_FPATH'], 'source': 'provider_hook'}
 }
 print(json.dumps(event))
 " >> "$ROOM_DIR/code.jsonl" 2>/dev/null

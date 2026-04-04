@@ -308,7 +308,12 @@ fn provider_wrapper_script(
     let _ = std::fs::create_dir_all(&wrapper_dir);
     let wrapper_path = wrapper_dir.join(format!("{}.sh", endpoint_id));
     let script = format!(
-        "#!/bin/bash\nexport ZELLIJ_AGENT_SHARED_ID={shared_id}\nexport ZELLIJ_AGENT_ENDPOINT_ID={endpoint_id}\nexport ZELLIJ_AGENT_PROVIDER={provider}\nexport ZELLIJ_AGENT_ROLE={role}\nexec {provider_command} \"$@\"\n"
+        "#!/bin/bash\nexport ZELLIJ_AGENT_SHARED_ID={}\nexport ZELLIJ_AGENT_ENDPOINT_ID={}\nexport ZELLIJ_AGENT_PROVIDER={}\nexport ZELLIJ_AGENT_ROLE={}\nexec {} \"$@\"\n",
+        shell_escape(shared_id),
+        shell_escape(endpoint_id),
+        shell_escape(provider),
+        shell_escape(role),
+        provider_command, // already a known command name, not user input
     );
     let _ = std::fs::write(&wrapper_path, &script);
     #[cfg(unix)]
@@ -317,6 +322,19 @@ fn provider_wrapper_script(
         let _ = std::fs::set_permissions(&wrapper_path, std::fs::Permissions::from_mode(0o755));
     }
     wrapper_path.display().to_string()
+}
+
+fn shell_escape(value: &str) -> String {
+    if value.is_empty() {
+        return "''".to_owned();
+    }
+    if value
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '-' || c == '_' || c == '.' || c == '/')
+    {
+        return value.to_owned();
+    }
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 fn latest_driver_endpoint(endpoints: &[EndpointMetadata]) -> Option<&EndpointMetadata> {
