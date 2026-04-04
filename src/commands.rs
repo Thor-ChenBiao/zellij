@@ -272,21 +272,19 @@ fn generate_short_room_id() -> String {
 
 fn choose_room_id_from_context(
     shared_id: Option<String>,
-    current_room_id: Option<String>,
+    current_session_name: Option<String>,
 ) -> String {
     shared_id
-        .or(current_room_id)
+        .or(current_session_name)
         .unwrap_or_else(generate_short_room_id)
 }
 
-fn current_room_id_from_context() -> Option<String> {
-    envs::get_session_name()
-        .ok()
-        .filter(|current_session| room_metadata(current_session).is_ok())
+fn current_session_name_from_context() -> Option<String> {
+    envs::get_session_name().ok()
 }
 
 fn resolve_default_room_id(shared_id: Option<String>) -> String {
-    choose_room_id_from_context(shared_id, current_room_id_from_context())
+    choose_room_id_from_context(shared_id, current_session_name_from_context())
 }
 
 fn terminal_provider_command(provider: &str) -> Option<&'static str> {
@@ -710,7 +708,7 @@ pub(crate) fn start_shared_room(
 }
 
 pub(crate) fn view_shared_room(stream: ViewStreamKind, shared_id: Option<String>) {
-    let shared_id = shared_id.unwrap_or_else(generate_unique_session_name_or_exit);
+    let shared_id = resolve_shared_room_id(shared_id);
     let _ = crate::agent_control_plane::ensure_room(&shared_id).unwrap_or_else(|e| {
         eprintln!("Failed to initialize shared room '{}': {}", shared_id, e);
         process::exit(2);
@@ -2145,7 +2143,7 @@ mod tests {
     }
 
     #[test]
-    fn choose_room_id_from_context_prefers_existing_current_room() {
+    fn choose_room_id_from_context_prefers_current_session_name() {
         let resolved = choose_room_id_from_context(None, Some("room-123456".to_owned()));
 
         assert_eq!(resolved, "room-123456");

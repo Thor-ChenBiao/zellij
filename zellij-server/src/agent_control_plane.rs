@@ -13,10 +13,17 @@ pub(crate) struct StreamEmission {
     pub payload: serde_json::Value,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AcpSpecialCommand {
+    EnsureRoom,
+    LaunchProvider { provider: String },
+}
+
 #[derive(Default)]
 pub(crate) struct RoomTelemetry {
     pane_viewport_hashes: HashMap<PaneId, u64>,
     pty_line_buffers: HashMap<u32, String>,
+    pane_input_buffers: HashMap<PaneId, String>,
 }
 
 impl RoomTelemetry {
@@ -103,6 +110,47 @@ impl RoomTelemetry {
             });
         }
         emissions
+    }
+
+    pub fn ingest_input_bytes(
+        &mut self,
+        pane_id: PaneId,
+        raw_bytes: &[u8],
+    ) -> Vec<AcpSpecialCommand> {
+        let input = String::from_utf8_lossy(raw_bytes);
+        let buffer = self.pane_input_buffers.entry(pane_id).or_default();
+        let mut commands = vec![];
+        let mut chars = input.chars().peekable();
+
+        while let Some(ch) = chars.next() {
+            match ch {
+                '\u{1b}' => skip_escape_sequence(&mut chars),
+                '\u{8}' | '\u{7f}' => {
+                    buffer.pop();
+                },
+                '\r' | '\n' => {
+                    if let Some(command) = detect_special_command(buffer.trim()) {
+                        commands.push(command);
+                    }
+                    buffer.clear();
+                },
+                _ if ch.is_control() => {},
+                _ => buffer.push(ch),
+            }
+        }
+
+        if buffer.chars().count() > 256 {
+            let keep: String = buffer
+                .chars()
+                .rev()
+                .take(128)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            *buffer = keep;
+        }
+        commands
     }
 }
 
@@ -198,6 +246,23 @@ fn detect_tool_call(line: &str) -> Option<(String, String)> {
     None
 }
 
+fn detect_special_command(line: &str) -> Option<AcpSpecialCommand> {
+    let mut parts = line.split_whitespace();
+    let first = parts.next()?;
+    match first {
+        "claude" | "codex" | "gemini" => Some(AcpSpecialCommand::LaunchProvider {
+            provider: first.to_owned(),
+        }),
+        "zellij" => match parts.next()? {
+            "claude" | "codex" | "gemini" | "reviewer" | "review" | "view" => {
+                Some(AcpSpecialCommand::EnsureRoom)
+            },
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 fn extract_file_hint(line: &str) -> Option<String> {
     const FILE_EXTENSIONS: &[&str] = &[
         ".rs", ".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".java", ".kt", ".kts", ".c", ".cc",
@@ -278,5 +343,43 @@ mod tests {
         assert!(emissions.is_empty());
         assert!(buffer.len() <= 1024);
         assert!(buffer.chars().all(|ch| ch == '你'));
+    }
+
+    #[test]
+    fn detects_plain_provider_launches_from_user_input() {
+        let mut telemetry = RoomTelemetry::default();
+        let commands =
+            telemetry.ingest_input_bytes(PaneId::Terminal(1), b"claude --model opus\r");
+        assert_eq!(
+            commands,
+            vec![AcpSpecialCommand::LaunchProvider {
+                provider: "claude".to_owned()
+            }]
+        );
+    }
+
+    #[test]
+    fn detects_zellij_acp_commands_from_user_input() {
+        let mut telemetry = RoomTelemetry::default();
+        let commands =
+            telemetry.ingest_input_bytes(PaneId::Terminal(1), b"zellij reviewer 123456\n");
+        assert_eq!(commands, vec![AcpSpecialCommand::EnsureRoom]);
+    }
+
+    #[test]
+    fn detects_provider_launches_across_segmented_input_and_enter() {
+        let mut telemetry = RoomTelemetry::default();
+        let first = telemetry.ingest_input_bytes(PaneId::Terminal(1), b"cla");
+        let second = telemetry.ingest_input_bytes(PaneId::Terminal(1), b"ude");
+        let third = telemetry.ingest_input_bytes(PaneId::Terminal(1), b"\r");
+
+        assert!(first.is_empty());
+        assert!(second.is_empty());
+        assert_eq!(
+            third,
+            vec![AcpSpecialCommand::LaunchProvider {
+                provider: "claude".to_owned()
+            }]
+        );
     }
 }

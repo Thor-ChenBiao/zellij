@@ -64,6 +64,11 @@ ACP hopeful-apricot | claude/driver | D1 R1
 
 - [Reviewer 自主性与通信协议](/Users/chenbiao/zellij/docs/agent-control-plane/reviewer-protocol.md)
 
+上下文笔记：
+
+- [原始设计笔记](/Users/chenbiao/zellij/docs/agent-control-plane/notes/agent-control-plane-ideas.md)
+- [Codex 会话历史快照](/Users/chenbiao/zellij/docs/agent-control-plane/context/codex-history-019d4ea6-62ec-77c1-bff7-f013e8d17116.jsonl)
+
 第一阶段目标 provider：
 
 - Claude Code

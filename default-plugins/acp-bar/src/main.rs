@@ -23,6 +23,8 @@ struct State {
 #[derive(Default, Deserialize)]
 struct RoomStatePayload {
     room_id: Option<String>,
+    self_provider: Option<String>,
+    self_role: Option<String>,
     driver_count: Option<usize>,
     reviewer_count: Option<usize>,
     human_count: Option<usize>,
@@ -76,6 +78,12 @@ impl ZellijPlugin for State {
         if let Some(room_id) = payload.room_id {
             self.room_id = room_id;
         }
+        if let Some(self_provider) = payload.self_provider {
+            self.self_provider = self_provider;
+        }
+        if let Some(self_role) = payload.self_role {
+            self.self_role = self_role;
+        }
         if let Some(driver_count) = payload.driver_count {
             self.driver_count = driver_count;
         }
@@ -99,26 +107,46 @@ impl ZellijPlugin for State {
         let accent_background = to_ansi_color(accent_background);
         let accent_text = to_ansi_color(accent_text);
 
-        let prefix = Style::new()
-            .fg(accent_text)
-            .on(accent_background)
-            .bold()
-            .paint(" ACP ");
-        let body = self.render_body(cols.saturating_sub(5));
-        let body = Style::new()
-            .fg(text)
-            .on(background)
-            .paint(format!(" {}", body));
+        let has_room = !self.room_id.trim().is_empty();
+        let prefix = has_room.then(|| {
+            Style::new()
+                .fg(accent_text)
+                .on(accent_background)
+                .bold()
+                .paint(" ACP ")
+        });
+        let prefix_width = if has_room { 5 } else { 0 };
+        let body = self.render_body(cols.saturating_sub(prefix_width));
+        let body = Style::new().fg(text).on(background).paint(if has_room {
+            format!(" {}", body)
+        } else {
+            body
+        });
 
         match background {
             RGB(r, g, b) => {
-                print!("{}{}\u{1b}[48;2;{};{};{}m\u{1b}[0K", prefix, body, r, g, b);
+                if let Some(prefix) = prefix {
+                    print!("{}{}", prefix, body);
+                } else {
+                    print!("{}", body);
+                }
+                print!("\u{1b}[48;2;{};{};{}m\u{1b}[0K", r, g, b);
             },
             Fixed(color) => {
-                print!("{}{}\u{1b}[48;5;{}m\u{1b}[0K", prefix, body, color);
+                if let Some(prefix) = prefix {
+                    print!("{}{}", prefix, body);
+                } else {
+                    print!("{}", body);
+                }
+                print!("\u{1b}[48;5;{}m\u{1b}[0K", color);
             },
             _ => {
-                print!("{}{}\u{1b}[0K", prefix, body);
+                if let Some(prefix) = prefix {
+                    print!("{}{}", prefix, body);
+                } else {
+                    print!("{}", body);
+                }
+                print!("\u{1b}[0K");
             },
         }
     }
@@ -126,11 +154,13 @@ impl ZellijPlugin for State {
 
 impl State {
     fn render_body(&self, available_cols: usize) -> String {
+        if self.room_id.trim().is_empty() {
+            return String::new();
+        }
         let full = format!(
-            "room: {} | self: {}/{} | roles: {}",
+            "room: {}{} | roles: {}",
             self.room_id,
-            self.self_provider,
-            self.self_role,
+            self.render_self_section(false),
             self.role_summary(false)
         );
         if display_width(&full) <= available_cols {
@@ -138,10 +168,9 @@ impl State {
         }
 
         let compact = format!(
-            "{} | {}/{} | {}",
+            "{}{} | {}",
             self.room_id,
-            self.self_provider,
-            self.self_role,
+            self.render_self_section(true),
             self.role_summary(true)
         );
         if display_width(&compact) <= available_cols {
@@ -149,6 +178,17 @@ impl State {
         }
 
         truncate_display(&format!("room: {}", self.room_id), available_cols)
+    }
+
+    fn render_self_section(&self, compact: bool) -> String {
+        if self.self_provider.trim().is_empty() || self.self_role.trim().is_empty() {
+            return String::new();
+        }
+        if compact {
+            format!(" | {}/{}", self.self_provider, self.self_role)
+        } else {
+            format!(" | self: {}/{}", self.self_provider, self.self_role)
+        }
     }
 
     fn role_summary(&self, compact: bool) -> String {
@@ -208,5 +248,36 @@ fn to_ansi_color(color: PaletteColor) -> ansi_term::Color {
     match color {
         PaletteColor::Rgb((r, g, b)) => RGB(r, g, b),
         PaletteColor::EightBit(color) => Fixed(color),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn render_body_is_blank_without_room() {
+        let state = State::default();
+
+        assert_eq!(state.render_body(80), "");
+    }
+
+    #[test]
+    fn render_body_falls_back_to_compact_format_when_width_is_tight() {
+        let state = State {
+            room_id: "123456".to_owned(),
+            self_provider: "claude".to_owned(),
+            self_role: "driver".to_owned(),
+            driver_count: 1,
+            reviewer_count: 2,
+            human_count: 0,
+            mode_info: ModeInfo::default(),
+        };
+
+        let rendered = state.render_body(32);
+
+        assert!(rendered.contains("123456"));
+        assert!(rendered.contains("claude/driver"));
+        assert!(rendered.contains("D1 R2"));
     }
 }

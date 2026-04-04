@@ -40,7 +40,10 @@ use crate::route::NotificationEnd;
 
 use log::{debug, warn};
 use serde_json::json;
-use zellij_utils::agent_control_plane::{append_session_stream_event, ViewStreamKind};
+use zellij_utils::agent_control_plane::{
+    append_session_stream_event, bound_endpoint_for_pane, ensure_bound_driver_endpoint,
+    ensure_room_files, list_room_endpoints, room_exists, ViewStreamKind,
+};
 use zellij_utils::data::{
     CommandOrPlugin, Direction, EventType, FloatingPaneCoordinates, GetFocusedPaneInfoResponse,
     KeyWithModifier, LayoutInfo, LayoutWithError, ListPanesResponse, ListTabsResponse,
@@ -68,7 +71,9 @@ use zellij_utils::{
     position::Position,
 };
 
-use crate::agent_control_plane::{sanitize_terminal_output, RoomTelemetry, StreamEmission};
+use crate::agent_control_plane::{
+    sanitize_terminal_output, AcpSpecialCommand, RoomTelemetry, StreamEmission,
+};
 use crate::background_jobs::BackgroundJob;
 use crate::os_input_output::ResizeCache;
 use crate::pane_groups::PaneGroups;
@@ -4700,6 +4705,159 @@ impl Screen {
             }),
         );
     }
+    fn send_acp_room_state(
+        &self,
+        client_id: ClientId,
+        shared_id: &str,
+        self_provider: Option<&str>,
+        self_role: Option<&str>,
+    ) {
+        let endpoints = match list_room_endpoints(shared_id) {
+            Ok(endpoints) => endpoints,
+            Err(err) => {
+                debug!(
+                    "failed to load ACP room endpoints for session {}: {}",
+                    shared_id, err
+                );
+                return;
+            },
+        };
+        let mut driver_count = 0;
+        let mut reviewer_count = 0;
+        let mut human_count = 0;
+        for endpoint in endpoints {
+            match endpoint.role.as_str() {
+                "driver" => driver_count += 1,
+                "reviewer" => reviewer_count += 1,
+                "human" => human_count += 1,
+                _ => {},
+            }
+        }
+        let payload = json!({
+            "room_id": shared_id,
+            "self_provider": self_provider,
+            "self_role": self_role,
+            "driver_count": driver_count,
+            "reviewer_count": reviewer_count,
+            "human_count": human_count,
+        })
+        .to_string();
+        let _ = self.bus.senders.send_to_plugin(PluginInstruction::CliPipe {
+            pipe_id: format!("acp-room-state-{shared_id}"),
+            name: "acp-room-state".to_owned(),
+            payload: Some(payload),
+            plugin: None,
+            args: None,
+            configuration: None,
+            floating: None,
+            pane_id_to_replace: None,
+            pane_title: None,
+            cwd: None,
+            skip_cache: false,
+            cli_client_id: client_id,
+        });
+    }
+    fn maybe_capture_acp_special_commands(
+        &mut self,
+        client_id: ClientId,
+        pane_id: PaneId,
+        raw_bytes: &[u8],
+    ) {
+        if !matches!(pane_id, PaneId::Terminal(_)) || self.session_name.is_empty() {
+            return;
+        }
+        let commands = self
+            .room_telemetry
+            .ingest_input_bytes(pane_id.into(), raw_bytes);
+        for command in commands {
+            self.handle_acp_special_command(client_id, pane_id, command);
+        }
+    }
+    fn handle_acp_special_command(
+        &mut self,
+        client_id: ClientId,
+        pane_id: PaneId,
+        command: AcpSpecialCommand,
+    ) {
+        let shared_id = self.session_name.clone();
+        let pane_id_string = pane_id.to_string();
+        let room_was_missing = !room_exists(&shared_id);
+        if let Err(err) = ensure_room_files(&shared_id, &shared_id) {
+            debug!(
+                "failed to initialize ACP room files for session {}: {}",
+                shared_id, err
+            );
+            return;
+        }
+        if room_was_missing {
+            let _ = append_session_stream_event(
+                ViewStreamKind::Events,
+                &shared_id,
+                "session_upgraded_to_acp_room",
+                format!("Session '{}' upgraded to ACP room", shared_id),
+                json!({
+                    "trigger_pane_id": pane_id_string,
+                }),
+            );
+        }
+
+        let bound_endpoint = bound_endpoint_for_pane(&shared_id, &pane_id_string)
+            .ok()
+            .flatten();
+        match command {
+            AcpSpecialCommand::EnsureRoom => {
+                self.send_acp_room_state(client_id, &shared_id, None, None);
+            },
+            AcpSpecialCommand::LaunchProvider { provider } => {
+                if bound_endpoint.is_some() {
+                    return;
+                }
+                let cwd = std::env::current_dir()
+                    .unwrap_or_else(|_| PathBuf::from("."))
+                    .display()
+                    .to_string();
+                match ensure_bound_driver_endpoint(
+                    &shared_id,
+                    &shared_id,
+                    &provider,
+                    &cwd,
+                    std::process::id(),
+                    &pane_id_string,
+                ) {
+                    Ok((endpoint, created)) => {
+                        if created {
+                            let _ = append_session_stream_event(
+                                ViewStreamKind::Events,
+                                &shared_id,
+                                "driver_auto_detected",
+                                format!(
+                                    "Detected {} launch in {} and bound {}",
+                                    provider, pane_id_string, endpoint.endpoint_id
+                                ),
+                                json!({
+                                    "provider": provider,
+                                    "trigger_pane_id": pane_id_string,
+                                    "endpoint_id": endpoint.endpoint_id,
+                                }),
+                            );
+                        }
+                        self.send_acp_room_state(
+                            client_id,
+                            &shared_id,
+                            Some(&provider),
+                            Some("driver"),
+                        );
+                    },
+                    Err(err) => {
+                        debug!(
+                            "failed to auto-register {} driver for session {}: {}",
+                            provider, shared_id, err
+                        );
+                    },
+                }
+            },
+        }
+    }
     fn log_pty_bytes_to_room(&mut self, terminal_id: u32, vte_bytes: &[u8]) {
         for emission in self.room_telemetry.ingest_pty_bytes(terminal_id, vte_bytes) {
             self.append_room_emission(emission);
@@ -5389,6 +5547,13 @@ pub(crate) fn screen_thread_main(
                 }
                 let mut state_changed = false;
                 let client_input_mode = screen.get_client_input_mode(client_id);
+                if let Some(active_pane_id) = screen.get_active_pane_id(&client_id) {
+                    screen.maybe_capture_acp_special_commands(
+                        client_id,
+                        active_pane_id,
+                        &raw_bytes,
+                    );
+                }
                 screen.append_room_input_event(
                     "write_character",
                     None,
@@ -8100,6 +8265,9 @@ pub(crate) fn screen_thread_main(
                 screen.render(None)?;
             },
             ScreenInstruction::WriteToPaneId(bytes, pane_id, _completion) => {
+                if let Some(client_id) = screen.get_first_client_id() {
+                    screen.maybe_capture_acp_special_commands(client_id, pane_id, &bytes);
+                }
                 screen.append_room_input_event(
                     "write_to_pane_id",
                     Some(pane_id),
@@ -8118,6 +8286,15 @@ pub(crate) fn screen_thread_main(
                 screen.render(None)?;
             },
             ScreenInstruction::Paste(bytes, pane_id, client_id, _completion) => {
+                if pane_id.is_none() {
+                    if let Some(active_pane_id) = screen.get_active_pane_id(&client_id) {
+                        screen.maybe_capture_acp_special_commands(
+                            client_id,
+                            active_pane_id,
+                            &bytes,
+                        );
+                    }
+                }
                 screen.append_room_input_event(
                     "paste",
                     pane_id,
@@ -8168,6 +8345,9 @@ pub(crate) fn screen_thread_main(
                 pane_id,
                 _completion,
             ) => {
+                if let Some(client_id) = screen.get_first_client_id() {
+                    screen.maybe_capture_acp_special_commands(client_id, pane_id, &bytes);
+                }
                 screen.append_room_input_event(
                     "write_key_to_pane_id",
                     Some(pane_id),

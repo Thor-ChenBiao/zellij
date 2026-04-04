@@ -5,6 +5,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, SystemTime};
+use uuid::Uuid;
 
 use crate::consts::{VERSION, ZELLIJ_CACHE_DIR};
 
@@ -260,6 +261,110 @@ pub fn list_room_endpoints(shared_id: &str) -> io::Result<Vec<EndpointMetadata>>
     }
     endpoints.sort_by(|a, b| a.created_at.cmp(&b.created_at));
     Ok(endpoints)
+}
+
+pub fn bound_endpoint_for_pane(
+    shared_id: &str,
+    pane_id: &str,
+) -> io::Result<Option<EndpointMetadata>> {
+    Ok(list_room_endpoints(shared_id)?
+        .into_iter()
+        .find(|endpoint| endpoint.bound_pane_id.as_deref() == Some(pane_id)))
+}
+
+fn driver_label_for_provider(provider: &str) -> &'static str {
+    match provider {
+        "claude" => "Claude Driver",
+        "codex" => "Codex Driver",
+        "gemini" => "Gemini Driver",
+        _ => "Driver",
+    }
+}
+
+pub fn ensure_bound_driver_endpoint(
+    shared_id: &str,
+    session_name: &str,
+    provider: &str,
+    cwd: &str,
+    pid: u32,
+    pane_id: &str,
+) -> io::Result<(EndpointMetadata, bool)> {
+    let room_created = ensure_room_files(shared_id, session_name)?;
+    if let Some(mut endpoint) = bound_endpoint_for_pane(shared_id, pane_id)? {
+        let mut changed = false;
+        let desired_label = format!(
+            "{} {}",
+            driver_label_for_provider(provider),
+            endpoint.endpoint_id
+        );
+        if endpoint.provider != provider {
+            endpoint.provider = provider.to_owned();
+            changed = true;
+        }
+        if endpoint.role != "driver" {
+            endpoint.role = "driver".to_owned();
+            changed = true;
+        }
+        if endpoint.label != desired_label {
+            endpoint.label = desired_label;
+            changed = true;
+        }
+        if endpoint.cwd != cwd {
+            endpoint.cwd = cwd.to_owned();
+            changed = true;
+        }
+        if endpoint.pid != pid {
+            endpoint.pid = pid;
+            changed = true;
+        }
+        if endpoint.session_name != session_name {
+            endpoint.session_name = session_name.to_owned();
+            changed = true;
+        }
+        if endpoint.bound_pane_id.as_deref() != Some(pane_id) {
+            endpoint.bound_pane_id = Some(pane_id.to_owned());
+            endpoint.bound_pane_id_updated_at = Some(now_string());
+            changed = true;
+        }
+        if changed {
+            write_endpoint_metadata(shared_id, &endpoint)?;
+        }
+        return Ok((endpoint, false));
+    }
+
+    let endpoint_id = format!("{}-{}", provider, &Uuid::new_v4().to_string()[..8]);
+    let endpoint = EndpointMetadata {
+        endpoint_id: endpoint_id.clone(),
+        shared_id: shared_id.to_owned(),
+        session_name: session_name.to_owned(),
+        provider: provider.to_owned(),
+        role: "driver".to_owned(),
+        label: format!("{} {}", driver_label_for_provider(provider), endpoint_id),
+        cwd: cwd.to_owned(),
+        pid,
+        created_at: now_string(),
+        bound_pane_id: Some(pane_id.to_owned()),
+        bound_pane_id_updated_at: Some(now_string()),
+        reviewer_bootstrap_prompt: None,
+        review_message_template: None,
+    };
+    write_endpoint_metadata(shared_id, &endpoint)?;
+    append_stream_event(
+        ViewStreamKind::Events,
+        shared_id,
+        "participant_registered",
+        Some(&endpoint),
+        format!(
+            "{} joined room '{}' as {}",
+            endpoint.provider, shared_id, endpoint.role
+        ),
+        serde_json::json!({
+            "room_created": room_created,
+            "cwd": endpoint.cwd,
+            "auto_detected": true,
+        }),
+    )?;
+    Ok((endpoint, true))
 }
 
 pub fn follow_stream(shared_id: &str, stream: ViewStreamKind) -> io::Result<()> {
