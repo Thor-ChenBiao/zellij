@@ -512,6 +512,24 @@ fn focus_pane_in_session(session_name: &str, pane_id: &str) -> Result<(), String
     )
 }
 
+fn close_current_launcher_pane_if_needed(
+    session_name: &str,
+    replacement_pane_id: &str,
+) -> Result<(), String> {
+    let Ok(current_pane_id) = std::env::var("ZELLIJ_PANE_ID") else {
+        return Ok(());
+    };
+    if current_pane_id == replacement_pane_id {
+        return Ok(());
+    }
+    run_cli_action_in_session(
+        session_name,
+        CliAction::ClosePane {
+            pane_id: Some(current_pane_id),
+        },
+    )
+}
+
 pub(crate) fn start_shared_room(
     mut opts: CliArgs,
     persona: AgentPersona,
@@ -654,6 +672,7 @@ pub(crate) fn start_shared_room(
                 }
                 if launched_inside_target_session {
                     let _ = focus_pane_in_session(&shared_id, &pane_id);
+                    let _ = close_current_launcher_pane_if_needed(&shared_id, &pane_id);
                 }
             },
             Err(e) => {
