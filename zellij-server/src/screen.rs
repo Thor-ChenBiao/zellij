@@ -4757,6 +4757,30 @@ impl Screen {
             cli_client_id: client_id,
         });
     }
+    fn maybe_rename_active_tab_to_room(&mut self, client_id: ClientId, shared_id: &str) {
+        let client_id = if self.get_active_tab(client_id).is_ok() {
+            Some(client_id)
+        } else {
+            self.get_first_client_id()
+        };
+        let Some(client_id) = client_id else {
+            return;
+        };
+        let Ok(active_tab) = self.get_active_tab_mut(client_id) else {
+            return;
+        };
+        if !should_auto_name_tab_for_room(&active_tab.name, shared_id) {
+            return;
+        }
+        active_tab.prev_name = active_tab.name.clone();
+        active_tab.name = shared_id.to_owned();
+        if let Err(err) = self.log_and_report_session_state() {
+            debug!(
+                "failed to rename upgraded ACP tab for session {}: {}",
+                shared_id, err
+            );
+        }
+    }
     fn maybe_capture_acp_special_commands(
         &mut self,
         client_id: ClientId,
@@ -4799,6 +4823,7 @@ impl Screen {
                     "trigger_pane_id": pane_id_string,
                 }),
             );
+            self.maybe_rename_active_tab_to_room(client_id, &shared_id);
         }
 
         let bound_endpoint = bound_endpoint_for_pane(&shared_id, &pane_id_string)
@@ -9405,6 +9430,39 @@ pub(crate) fn screen_thread_main(
         }
     }
     Ok(())
+}
+
+fn should_auto_name_tab_for_room(current_tab_name: &str, shared_id: &str) -> bool {
+    if shared_id.trim().is_empty() {
+        return false;
+    }
+    let current_tab_name = current_tab_name.trim();
+    current_tab_name.is_empty()
+        || (current_tab_name.starts_with("Tab #")
+            && current_tab_name
+                .strip_prefix("Tab #")
+                .map(|suffix| !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit()))
+                .unwrap_or(false))
+}
+
+#[cfg(test)]
+mod acp_room_tab_name_tests {
+    use super::should_auto_name_tab_for_room;
+
+    #[test]
+    fn auto_names_default_tabs_for_rooms() {
+        assert!(should_auto_name_tab_for_room("Tab #1", "123456"));
+        assert!(should_auto_name_tab_for_room("Tab #12", "123456"));
+        assert!(should_auto_name_tab_for_room("", "123456"));
+    }
+
+    #[test]
+    fn preserves_non_default_tab_names() {
+        assert!(!should_auto_name_tab_for_room("work", "123456"));
+        assert!(!should_auto_name_tab_for_room("Claude", "123456"));
+        assert!(!should_auto_name_tab_for_room("Tab #abc", "123456"));
+        assert!(!should_auto_name_tab_for_room("Tab #1", ""));
+    }
 }
 
 #[path = "./unit/screen_tests.rs"]

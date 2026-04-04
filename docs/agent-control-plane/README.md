@@ -21,6 +21,7 @@
 - 不带 `id` 会创建一个新的共享房间 ID，并打印出来
 - 带 `id` 时，如果房间存在就加入；不存在就创建
 - 房间和参与者元数据会持久化到 Zellij 的缓存目录
+- 在普通 Zellij session 里，如果用户直接在 pane 中键入 `claude` / `codex` / `gemini` 并回车，当前 session 会自动升级成 ACP room，并把当前 pane 绑定成对应的 driver
 - `zellij claude [id]` / `zellij codex [id]` / `zellij gemini [id]` 新建房间时会保留原生 `status-bar`，并在其下新增一条 `acp-bar`
 - `reviewer` 会记录一份启动 bootstrap prompt 和固定的 review message template
 - `view events` 和 `view code` 会跟随房间自己的流文件
@@ -47,6 +48,7 @@ review request / feedback 的文件化闭环已经落地，driver pane 的自动
   - `room id`
   - 当前 endpoint 的 `provider/role`
   - 已加入房间的角色计数，例如 `D1 R1 H0`
+- 如果普通 session 是通过“直接输入 provider 命令”的方式被升级成 ACP room，而当前 tab 仍是默认的 `Tab #N`，系统会自动把 tab 名改成 room id，避免房间信息只能依赖启动日志或底栏提示
 
 示例：
 
