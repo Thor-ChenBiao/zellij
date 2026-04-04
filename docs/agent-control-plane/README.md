@@ -66,6 +66,7 @@ ACP hopeful-apricot | claude/driver | D1 R1
 
 上下文笔记：
 
+- [上下文导读](/Users/chenbiao/zellij/docs/agent-control-plane/context/README.md)
 - [原始设计笔记](/Users/chenbiao/zellij/docs/agent-control-plane/notes/agent-control-plane-ideas.md)
 - [Codex 会话历史快照](/Users/chenbiao/zellij/docs/agent-control-plane/context/codex-history-019d4ea6-62ec-77c1-bff7-f013e8d17116.jsonl)
 
