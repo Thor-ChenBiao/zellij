@@ -351,6 +351,10 @@ fn kdl_string(value: &str) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_owned())
 }
 
+fn room_tab_label(shared_id: &str) -> String {
+    format!("ACP {}", shared_id)
+}
+
 fn count_room_roles(endpoints: &[EndpointMetadata]) -> RoomRoleCounts {
     let mut counts = RoomRoleCounts::default();
     for endpoint in endpoints {
@@ -402,7 +406,9 @@ fn room_layout_string(
     endpoint: &EndpointMetadata,
     role_counts: RoomRoleCounts,
 ) -> String {
+    let shared_id_label = room_tab_label(shared_id);
     let shared_id = kdl_string(shared_id);
+    let tab_label = kdl_string(&shared_id_label);
     let cwd = kdl_string(&cwd.display().to_string());
     let self_provider = kdl_string(&endpoint.provider);
     let self_role = kdl_string(&endpoint.role);
@@ -414,11 +420,11 @@ fn room_layout_string(
         Some(provider_command) => {
             let command = kdl_string(provider_command);
             format!(
-                "layout {{\n    tab name={shared_id} focus=true {{\n        pane size=1 borderless=true {{\n            plugin location=\"tab-bar\"\n        }}\n        pane command={command} cwd={cwd} focus=true\n        pane size=1 borderless=true {{\n            plugin location=\"status-bar\"\n        }}\n{acp_bar}\n    }}\n}}"
+                "layout {{\n    tab name={tab_label} focus=true {{\n        pane size=1 borderless=true {{\n            plugin location=\"tab-bar\"\n        }}\n        pane command={command} cwd={cwd} focus=true\n        pane size=1 borderless=true {{\n            plugin location=\"status-bar\"\n        }}\n{acp_bar}\n    }}\n}}"
             )
         },
         None => format!(
-            "layout {{\n    tab name={shared_id} focus=true {{\n        pane size=1 borderless=true {{\n            plugin location=\"tab-bar\"\n        }}\n        pane cwd={cwd} focus=true\n        pane size=1 borderless=true {{\n            plugin location=\"status-bar\"\n        }}\n{acp_bar}\n    }}\n}}"
+            "layout {{\n    tab name={tab_label} focus=true {{\n        pane size=1 borderless=true {{\n            plugin location=\"tab-bar\"\n        }}\n        pane cwd={cwd} focus=true\n        pane size=1 borderless=true {{\n            plugin location=\"status-bar\"\n        }}\n{acp_bar}\n    }}\n}}"
         ),
     }
 }

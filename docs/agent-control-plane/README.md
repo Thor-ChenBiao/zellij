@@ -48,7 +48,7 @@ review request / feedback 的文件化闭环已经落地，driver pane 的自动
   - `room id`
   - 当前 endpoint 的 `provider/role`
   - 已加入房间的角色计数，例如 `D1 R1 H0`
-- 如果普通 session 是通过“直接输入 provider 命令”的方式被升级成 ACP room，而当前 tab 仍是默认的 `Tab #N`，系统会自动把 tab 名改成 room id，避免房间信息只能依赖启动日志或底栏提示
+- 如果普通 session 是通过“直接输入 provider 命令”的方式被升级成 ACP room，而当前 tab 仍是默认的 `Tab #N`，系统会自动把 tab 名改成 `ACP <room-id>`，避免房间信息只能依赖启动日志或底栏提示
 
 示例：
 

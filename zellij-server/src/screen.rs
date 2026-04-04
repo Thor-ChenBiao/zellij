@@ -4773,7 +4773,7 @@ impl Screen {
             return;
         }
         active_tab.prev_name = active_tab.name.clone();
-        active_tab.name = shared_id.to_owned();
+        active_tab.name = room_tab_label(shared_id);
         if let Err(err) = self.log_and_report_session_state() {
             debug!(
                 "failed to rename upgraded ACP tab for session {}: {}",
@@ -9445,9 +9445,13 @@ fn should_auto_name_tab_for_room(current_tab_name: &str, shared_id: &str) -> boo
                 .unwrap_or(false))
 }
 
+fn room_tab_label(shared_id: &str) -> String {
+    format!("ACP {}", shared_id)
+}
+
 #[cfg(test)]
 mod acp_room_tab_name_tests {
-    use super::should_auto_name_tab_for_room;
+    use super::{room_tab_label, should_auto_name_tab_for_room};
 
     #[test]
     fn auto_names_default_tabs_for_rooms() {
@@ -9462,6 +9466,11 @@ mod acp_room_tab_name_tests {
         assert!(!should_auto_name_tab_for_room("Claude", "123456"));
         assert!(!should_auto_name_tab_for_room("Tab #abc", "123456"));
         assert!(!should_auto_name_tab_for_room("Tab #1", ""));
+    }
+
+    #[test]
+    fn room_tab_label_is_visibly_distinct() {
+        assert_eq!(room_tab_label("123456"), "ACP 123456");
     }
 }
 
