@@ -253,6 +253,42 @@ fn attach_create_command(session_name: String) -> Command {
     })
 }
 
+fn generate_short_room_id() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let seed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    for offset in 0..10_000u64 {
+        let candidate = 100_000 + ((seed + offset) % 900_000);
+        let candidate = candidate.to_string();
+        if room_metadata(&candidate).is_err() && !room_session_is_active(&candidate) {
+            return candidate;
+        }
+    }
+    generate_unique_session_name_or_exit()
+}
+
+fn choose_room_id_from_context(
+    shared_id: Option<String>,
+    current_room_id: Option<String>,
+) -> String {
+    shared_id
+        .or(current_room_id)
+        .unwrap_or_else(generate_short_room_id)
+}
+
+fn current_room_id_from_context() -> Option<String> {
+    envs::get_session_name()
+        .ok()
+        .filter(|current_session| room_metadata(current_session).is_ok())
+}
+
+fn resolve_default_room_id(shared_id: Option<String>) -> String {
+    choose_room_id_from_context(shared_id, current_room_id_from_context())
+}
+
 fn terminal_provider_command(provider: &str) -> Option<&'static str> {
     match provider {
         "claude" => Some("claude"),
@@ -467,12 +503,24 @@ fn inject_reviewer_bootstrap_into_pane(
     Ok(())
 }
 
+fn focus_pane_in_session(session_name: &str, pane_id: &str) -> Result<(), String> {
+    run_cli_action_in_session(
+        session_name,
+        CliAction::FocusPaneId {
+            pane_id: pane_id.to_owned(),
+        },
+    )
+}
+
 pub(crate) fn start_shared_room(
     mut opts: CliArgs,
     persona: AgentPersona,
     shared_id: Option<String>,
 ) {
-    let shared_id = shared_id.unwrap_or_else(generate_unique_session_name_or_exit);
+    let shared_id = resolve_default_room_id(shared_id);
+    let current_session_name = envs::get_session_name().ok();
+    let launched_inside_target_session =
+        current_session_name.as_deref() == Some(shared_id.as_str());
     let current_dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let participant = match register_participant(&shared_id, persona, &current_dir) {
         Ok(participant) => participant,
@@ -506,46 +554,48 @@ pub(crate) fn start_shared_room(
     let room_endpoints = list_room_endpoints(&shared_id).unwrap_or_default();
     let room_role_counts = count_room_roles(&room_endpoints);
 
-    println!(
-        "Shared room: {} ({})",
-        shared_id,
-        if participant.room_created {
-            "created"
+    if !launched_inside_target_session {
+        println!(
+            "Shared room: {} ({})",
+            shared_id,
+            if participant.room_created {
+                "created"
+            } else {
+                "joined"
+            }
+        );
+        println!("Session name: {}", participant.session_name);
+        println!(
+            "Endpoint: {} [{} / {}]",
+            participant.endpoint.label, participant.endpoint.provider, participant.endpoint.role
+        );
+        if persona == AgentPersona::Reviewer {
+            println!("");
+            println!("Reviewer bootstrap:");
+            println!(
+                "{}",
+                participant
+                    .endpoint
+                    .reviewer_bootstrap_prompt
+                    .as_deref()
+                    .unwrap_or_default()
+            );
+            println!("");
+            println!("Review message template:");
+            println!(
+                "{}",
+                participant
+                    .endpoint
+                    .review_message_template
+                    .as_deref()
+                    .unwrap_or_default()
+            );
         } else {
-            "joined"
+            println!(
+                "Share this room with another participant using: zellij reviewer {}",
+                shared_id
+            );
         }
-    );
-    println!("Session name: {}", participant.session_name);
-    println!(
-        "Endpoint: {} [{} / {}]",
-        participant.endpoint.label, participant.endpoint.provider, participant.endpoint.role
-    );
-    if persona == AgentPersona::Reviewer {
-        println!("");
-        println!("Reviewer bootstrap:");
-        println!(
-            "{}",
-            participant
-                .endpoint
-                .reviewer_bootstrap_prompt
-                .as_deref()
-                .unwrap_or_default()
-        );
-        println!("");
-        println!("Review message template:");
-        println!(
-            "{}",
-            participant
-                .endpoint
-                .review_message_template
-                .as_deref()
-                .unwrap_or_default()
-        );
-    } else {
-        println!(
-            "Share this room with another participant using: zellij reviewer {}",
-            shared_id
-        );
     }
 
     let (provider_command, provider_cwd) =
@@ -554,7 +604,11 @@ pub(crate) fn start_shared_room(
 
     if participant.room_created || !session_active {
         opts.command = None;
-        opts.session = Some(shared_id.clone());
+        opts.session = if launched_inside_target_session {
+            None
+        } else {
+            Some(shared_id.clone())
+        };
         opts.layout = None;
         opts.new_session_with_layout = None;
         opts.layout_string = Some(room_layout_string(
@@ -598,6 +652,9 @@ pub(crate) fn start_shared_room(
                         );
                     }
                 }
+                if launched_inside_target_session {
+                    let _ = focus_pane_in_session(&shared_id, &pane_id);
+                }
             },
             Err(e) => {
                 eprintln!(
@@ -619,6 +676,10 @@ pub(crate) fn start_shared_room(
                 "error": e,
             }),
         );
+    }
+
+    if launched_inside_target_session {
+        return;
     }
 
     opts.session = None;
@@ -2062,5 +2123,20 @@ mod tests {
         assert!(bootstrap_message.contains("source_endpoint: reviewer-abcd1234"));
         assert!(bootstrap_message.contains("[ACP_REVIEW_RESPONSE_V1]"));
         assert!(bootstrap_message.contains("[Review from reviewer]"));
+    }
+
+    #[test]
+    fn choose_room_id_from_context_prefers_existing_current_room() {
+        let resolved = choose_room_id_from_context(None, Some("room-123456".to_owned()));
+
+        assert_eq!(resolved, "room-123456");
+    }
+
+    #[test]
+    fn choose_room_id_from_context_generates_short_numeric_when_no_context_exists() {
+        let resolved = choose_room_id_from_context(None, None);
+
+        assert_eq!(resolved.len(), 6);
+        assert!(resolved.chars().all(|c| c.is_ascii_digit()));
     }
 }
